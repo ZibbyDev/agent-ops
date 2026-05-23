@@ -16,8 +16,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +27,7 @@ import (
 	"github.com/ZibbyHQ/agent-ops/internal/scheduler"
 	"github.com/ZibbyHQ/agent-ops/internal/state"
 	"github.com/ZibbyHQ/agent-ops/internal/task"
+	"github.com/ZibbyHQ/agent-ops/internal/zibby"
 )
 
 // EnsureToken returns the daemon's MCP bearer token. Priority:
@@ -135,6 +138,12 @@ func MaybeRunFirstRun(
 			"could not persist bootstrap fact: "+addErr.Error())
 	}
 
+	// Tell the Zibby control plane (if integrated) which port the
+	// installed app picked, so ALB host-routing can be wired. Silent no-op
+	// when ZIBBY_API_BASE_URL / INSTANCE_ID / AGENT_OPS_TOKEN aren't set.
+	mcpPort := parseMCPPort(cfg.MCP.ListenAddr)
+	zibby.RegisterPortIfNeeded(ctx, mcpPort)
+
 	return os.WriteFile(marker, []byte("ok"), 0o600)
 	// the marker has no business value beyond "we've been here" — its
 	// presence alone keeps subsequent restarts idempotent.
@@ -145,6 +154,22 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// parseMCPPort extracts the numeric port from cfg.MCP.ListenAddr, which is
+// typically ":7842" or "0.0.0.0:7842". Returns 7842 as a safe default when
+// parsing fails — only used to exclude the daemon's own listener when
+// scanning for the installed app's port.
+func parseMCPPort(addr string) int {
+	_, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 7842
+	}
+	n, err := strconv.Atoi(p)
+	if err != nil {
+		return 7842
+	}
+	return n
 }
 
 // We use task.TriggerBootstrap directly nowhere in this file (RunNow tags it
