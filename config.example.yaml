@@ -6,9 +6,19 @@
 state_dir: /var/lib/agent-ops
 
 agent:
+  # Two Claude providers:
+  #   "claude"     — direct REST API. Auth via x-api-key. Reads
+  #                  ANTHROPIC_API_KEY env. Bills against Anthropic API credit
+  #                  balance (separate from Claude.ai / Claude Code).
+  #   "claude-cli" — subprocess to the `claude` Code CLI binary
+  #                  (bundled in the official Docker image). Auth via
+  #                  CLAUDE_CODE_OAUTH_TOKEN. Bills against the user's
+  #                  Claude.ai / Claude Code subscription.
+  # Pick "claude-cli" when wrapping the daemon inside a tenant container
+  # whose owner already pays for Claude — no separate API billing needed.
   provider: claude
   model: claude-sonnet-4-6
-  api_key_env: ANTHROPIC_API_KEY    # env var read at startup
+  api_key_env: ANTHROPIC_API_KEY    # ignored when provider=claude-cli
   max_tool_calls_per_task: 25
   task_timeout: 10m
 

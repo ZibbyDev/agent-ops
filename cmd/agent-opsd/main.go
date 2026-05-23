@@ -35,6 +35,7 @@ import (
 	"github.com/ZibbyHQ/agent-ops/internal/config"
 	"github.com/ZibbyHQ/agent-ops/internal/driver"
 	"github.com/ZibbyHQ/agent-ops/internal/driver/claude"
+	"github.com/ZibbyHQ/agent-ops/internal/driver/claudecli"
 	"github.com/ZibbyHQ/agent-ops/internal/node"
 	"github.com/ZibbyHQ/agent-ops/internal/scheduler"
 	"github.com/ZibbyHQ/agent-ops/internal/state"
@@ -181,8 +182,16 @@ func buildDriver(cfg *config.Config) (driver.Driver, error) {
 			Model:           cfg.Agent.Model,
 			MaxOutputTokens: 4096,
 		}, nil
+	case "claude-cli":
+		// Shells out to the `claude` Code CLI binary; auth via
+		// CLAUDE_CODE_OAUTH_TOKEN env (read by the CLI itself, not us).
+		d := &claudecli.Driver{Model: cfg.Agent.Model}
+		if err := d.Preflight(); err != nil {
+			return nil, err
+		}
+		return d, nil
 	default:
-		return nil, fmt.Errorf("unsupported provider %q (v0.1 ships claude only)", cfg.Agent.Provider)
+		return nil, fmt.Errorf("unsupported provider %q (v0.1 ships claude + claude-cli)", cfg.Agent.Provider)
 	}
 }
 

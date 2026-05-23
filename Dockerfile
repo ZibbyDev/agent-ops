@@ -28,7 +28,8 @@ RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # on it. Static binary + tiny base = ~12MB image.
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata busybox-extras curl \
+RUN apk add --no-cache ca-certificates tzdata busybox-extras curl nodejs npm \
+    && npm install -g --no-audit --no-fund @anthropic-ai/claude-code \
     && adduser -D -u 10000 agentops \
     && mkdir -p /var/lib/agent-ops /etc/agent-ops \
     && chown -R agentops:agentops /var/lib/agent-ops /etc/agent-ops

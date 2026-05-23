@@ -156,10 +156,11 @@ func (c *Config) applyDefaults() {
 }
 
 var validProviders = map[string]bool{
-	"claude": true,
-	"codex":  true,
-	"gemini": true,
-	"ollama": true,
+	"claude":     true, // direct REST API via x-api-key (separate API billing)
+	"claude-cli": true, // subprocess `claude` binary, reads CLAUDE_CODE_OAUTH_TOKEN
+	"codex":      true,
+	"gemini":     true,
+	"ollama":     true,
 }
 
 func (c *Config) validate() error {
@@ -169,7 +170,10 @@ func (c *Config) validate() error {
 	if c.Agent.Provider == "claude" && c.Agent.Model == "" {
 		return errors.New("config: agent.model is required when provider=claude")
 	}
-	if c.Agent.APIKeyEnv == "" && c.Agent.Provider != "ollama" {
+	// claude-cli authenticates via CLAUDE_CODE_OAUTH_TOKEN env (read by the
+	// CLI binary itself), so agent.api_key_env is not meaningful for it.
+	// ollama is fully local. All other cloud providers need an api_key_env.
+	if c.Agent.APIKeyEnv == "" && c.Agent.Provider != "ollama" && c.Agent.Provider != "claude-cli" {
 		return errors.New("config: agent.api_key_env is required for cloud providers")
 	}
 	if c.Agent.MaxToolCallsPerTask < 1 {
