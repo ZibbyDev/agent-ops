@@ -80,8 +80,23 @@ type Schedule struct {
 	// model than the daemon-wide default. Empty → use agent.model. Cost
 	// lever: route routine checks to Haiku, reserve Sonnet/Opus for
 	// install / upgrade / incident-response prompts that need reasoning.
-	Model   string `yaml:"model,omitempty"`
-	Enabled *bool  `yaml:"enabled,omitempty"`
+	Model string `yaml:"model,omitempty"`
+
+	// VerifyPrompt enables an independent verifier pass that runs AFTER the
+	// main task completes. The verifier is a second LLM invocation (typically
+	// a cheaper model — set VerifyModel) whose job is to re-check the main
+	// agent's work via shell and emit strict JSON: {"pass": bool, ...}. The
+	// caller (bootstrap.MaybeRunFirstRun today) decides what to do with a
+	// pass=false result. Empty → no verifier runs. Used to catch the case
+	// where the main agent claims "done" but the install actually failed
+	// mid-way and the LLM lied about it.
+	VerifyPrompt string `yaml:"verify_prompt,omitempty"`
+
+	// VerifyModel overrides the verifier's model. Empty → falls back to the
+	// daemon default (agent.model). Pin this to Haiku for cheap re-checks.
+	VerifyModel string `yaml:"verify_model,omitempty"`
+
+	Enabled *bool `yaml:"enabled,omitempty"`
 }
 
 // MCPConfig drives the agent-ops MCP server.

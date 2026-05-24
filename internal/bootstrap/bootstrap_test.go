@@ -7,6 +7,100 @@ import (
 	"testing"
 )
 
+func TestExtractJSONObject(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+		ok   bool
+	}{
+		{
+			name: "plain JSON",
+			in:   `{"pass": true, "evidence": "ok"}`,
+			want: `{"pass": true, "evidence": "ok"}`,
+			ok:   true,
+		},
+		{
+			name: "leading prose",
+			in:   "Sure! Here is the JSON:\n{\"pass\": false, \"fail_reason\": \"port closed\"}\n",
+			want: `{"pass": false, "fail_reason": "port closed"}`,
+			ok:   true,
+		},
+		{
+			name: "nested objects",
+			in:   `prose {"pass": true, "nested": {"k": "v"}, "ok": 1} trailing`,
+			want: `{"pass": true, "nested": {"k": "v"}, "ok": 1}`,
+			ok:   true,
+		},
+		{
+			name: "braces inside strings ignored",
+			in:   `{"evidence": "saw } and { in output", "pass": true}`,
+			want: `{"evidence": "saw } and { in output", "pass": true}`,
+			ok:   true,
+		},
+		{
+			name: "no JSON",
+			in:   `the agent just said yes, looks good`,
+			ok:   false,
+		},
+		{
+			name: "unbalanced",
+			in:   `{"pass": true`,
+			ok:   false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := extractJSONObject(c.in)
+			if ok != c.ok {
+				t.Fatalf("ok = %v, want %v", ok, c.ok)
+			}
+			if ok && got != c.want {
+				t.Fatalf("got %q\nwant %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestParseVerifierJSON(t *testing.T) {
+	t.Run("pass true with prose around it", func(t *testing.T) {
+		r, err := parseVerifierJSON(`Sure: {"pass": true, "evidence": "ps shows pid 4231, curl 200"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !r.Pass {
+			t.Fatal("expected pass=true")
+		}
+		if !strings.Contains(r.Evidence, "pid 4231") {
+			t.Fatalf("evidence = %q", r.Evidence)
+		}
+	})
+	t.Run("pass false with fail_reason", func(t *testing.T) {
+		r, err := parseVerifierJSON(`{"pass": false, "evidence": "no process", "fail_reason": "n8n binary missing"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Pass {
+			t.Fatal("expected pass=false")
+		}
+		if r.FailReason != "n8n binary missing" {
+			t.Fatalf("fail_reason = %q", r.FailReason)
+		}
+	})
+	t.Run("no JSON at all is an error", func(t *testing.T) {
+		_, err := parseVerifierJSON("the agent forgot to emit JSON")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+	t.Run("malformed JSON is an error", func(t *testing.T) {
+		_, err := parseVerifierJSON(`{"pass": notbool}`)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+}
+
 func TestEnsureToken_PreferEnvWhenSet(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("MY_TOKEN", "from-env")

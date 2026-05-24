@@ -43,14 +43,23 @@ mcp:
 bootstrap:
   name: initial_setup
   prompt: |
-    You are setting up this host for the first time.
-    1. Check what's already installed.
-    2. Install + configure the target application per its README.
-    3. Verify the app is reachable on its expected port.
-    4. Report a one-paragraph summary of what you did.
+    Install + start the target app, verify it responds. Show curl
+    output as evidence of the app being alive.
   # Bootstrap genuinely needs to reason about install errors, package
   # mismatches, port conflicts — bump to Sonnet over the Haiku default.
   model: claude-sonnet-4-6
+  # OPTIONAL verifier pass. After the main bootstrap claims success, a
+  # second agent independently re-checks the work via shell and emits
+  # strict JSON. If `pass: false`, the daemon does NOT write the
+  # bootstrap.done marker, so a container restart re-runs the install.
+  # Use a cheap model — the verifier just runs `ps` + `curl` and decides.
+  verify_prompt: |
+    The previous agent claimed to install + start the application.
+    Independently verify by running the shell tool:
+      - ps shows the app process
+      - curl on the expected port returns a non-error response
+    Return STRICT JSON only (no prose): {"pass": bool, "evidence": "<one-line summary>", "fail_reason": "<empty or one-line>"}
+  verify_model: claude-haiku-4-5-20251001
   tools: [shell]
 
 # Recurring tasks. Each one fires on its cron expression. Edit names + prompts

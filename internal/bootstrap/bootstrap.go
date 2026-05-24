@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -138,6 +139,21 @@ func MaybeRunFirstRun(
 			"could not persist bootstrap fact: "+addErr.Error())
 	}
 
+	// Optional verifier pass. The main agent sometimes lies about success
+	// (e.g. n8n install crashed mid-way, agent reports "done"). If the
+	// operator configured verify_prompt, run a second pass — typically a
+	// cheaper model — that independently re-checks via shell and emits
+	// strict JSON. pass=false skips writing the marker so the next
+	// container start retries the whole bootstrap. We don't fail the
+	// daemon — partial success + visible diagnostics > daemon crashloop.
+	if strings.TrimSpace(cfg.Bootstrap.VerifyPrompt) != "" {
+		ok := runVerifier(ctx, cfg, sched, store, t.Name)
+		if !ok {
+			// Don't write marker. Operator (or next restart) re-triggers.
+			return nil
+		}
+	}
+
 	// Tell the Zibby control plane (if integrated) which port the
 	// installed app picked, so ALB host-routing can be wired. Silent no-op
 	// when ZIBBY_API_BASE_URL / INSTANCE_ID / AGENT_OPS_TOKEN aren't set.
@@ -147,6 +163,146 @@ func MaybeRunFirstRun(
 	return os.WriteFile(marker, []byte("ok"), 0o600)
 	// the marker has no business value beyond "we've been here" — its
 	// presence alone keeps subsequent restarts idempotent.
+}
+
+// verifierResult is the strict JSON shape the verifier prompt asks for.
+// We tolerate prose around the JSON — extractJSONObject finds the first
+// brace-delimited block before unmarshaling.
+type verifierResult struct {
+	Pass       bool   `json:"pass"`
+	Evidence   string `json:"evidence"`
+	FailReason string `json:"fail_reason"`
+}
+
+// runVerifier executes the verify_prompt as a one-shot task and parses the
+// JSON answer. Returns true iff the verifier reported pass=true. Any error
+// (run failure, unparseable output, etc.) is treated as pass=false — we
+// don't claim success on ambiguous signal.
+func runVerifier(
+	ctx context.Context,
+	cfg *config.Config,
+	sched *scheduler.Scheduler,
+	store *state.Store,
+	bootstrapTaskName string,
+) bool {
+	verifyName := bootstrapTaskName + ".verify"
+
+	// Persist as a disabled task so we can route through sched.RunNow (which
+	// looks up Tools, prompt, etc. by name from the store) and so the MCP
+	// layer can introspect verifier runs after the fact.
+	vt := state.Task{
+		Name:    verifyName,
+		Cron:    "@yearly", // never auto-fires
+		Prompt:  cfg.Bootstrap.VerifyPrompt,
+		Tools:   cfg.Bootstrap.Tools,
+		Enabled: false,
+	}
+	if err := store.UpsertTask(ctx, vt); err != nil {
+		slog.Warn("bootstrap: verifier upsert failed, skipping verification", "error", err)
+		return false
+	}
+	// Plumb the per-task model override through the same map RunNow reads.
+	sched.SetModelOverride(verifyName, cfg.Bootstrap.VerifyModel)
+
+	slog.Info("bootstrap: running verifier pass", "name", verifyName,
+		"model", cfg.Bootstrap.VerifyModel)
+
+	vrun, vErr := sched.RunNow(ctx, verifyName, cfg.Bootstrap.VerifyPrompt)
+	if vErr != nil {
+		slog.Warn("bootstrap: verifier run failed", "error", vErr)
+		_, _ = store.AddFact(ctx, "bootstrap",
+			"verify_failed: verifier run errored at "+time.Now().UTC().Format(time.RFC3339)+
+				": "+vErr.Error())
+		return false
+	}
+
+	res, parseErr := parseVerifierJSON(vrun.Summary)
+	if parseErr != nil {
+		slog.Warn("bootstrap: verifier output unparseable, treating as fail",
+			"error", parseErr,
+			"summary", truncate(vrun.Summary, 400),
+		)
+		_, _ = store.AddFact(ctx, "bootstrap",
+			"verify_failed: could not parse verifier JSON at "+time.Now().UTC().Format(time.RFC3339)+
+				": "+parseErr.Error())
+		return false
+	}
+
+	slog.Info("bootstrap: verifier complete",
+		"pass", res.Pass,
+		"evidence", res.Evidence,
+		"fail_reason", res.FailReason,
+		"run_id", vrun.ID,
+	)
+
+	if !res.Pass {
+		_, _ = store.AddFact(ctx, "bootstrap",
+			"verify_failed at "+time.Now().UTC().Format(time.RFC3339)+
+				": "+res.FailReason+" (evidence: "+res.Evidence+")")
+		return false
+	}
+
+	_, _ = store.AddFact(ctx, "bootstrap",
+		"verify_passed at "+time.Now().UTC().Format(time.RFC3339)+
+			": "+res.Evidence)
+	return true
+}
+
+// parseVerifierJSON extracts the first {...} block from s and unmarshals it
+// into a verifierResult. Tolerates leading/trailing prose because LLMs love
+// to add "Sure! Here's the JSON:" no matter how strict the prompt is.
+func parseVerifierJSON(s string) (verifierResult, error) {
+	raw, ok := extractJSONObject(s)
+	if !ok {
+		return verifierResult{}, errors.New("no JSON object found in verifier output")
+	}
+	var v verifierResult
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return verifierResult{}, fmt.Errorf("unmarshal: %w", err)
+	}
+	return v, nil
+}
+
+// extractJSONObject returns the substring from the first '{' to its matching
+// closing '}', balancing braces and ignoring braces inside JSON strings.
+// Returns (raw, true) on success.
+func extractJSONObject(s string) (string, bool) {
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return "", false
+	}
+	depth := 0
+	inStr := false
+	esc := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			if esc {
+				esc = false
+				continue
+			}
+			if c == '\\' {
+				esc = true
+				continue
+			}
+			if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1], true
+			}
+		}
+	}
+	return "", false
 }
 
 func truncate(s string, n int) string {
