@@ -75,16 +75,30 @@ func RegisterPortIfNeeded(ctx context.Context, mcpPort int) {
 	slog.Info("zibby: register-port ok", "status", resp.StatusCode, "port", port)
 }
 
-// detectAppPort enumerates LISTEN-state TCP sockets from /proc/net/tcp and
-// returns the first port that's not the daemon's own MCP port. /proc/net
-// is read-only and free, avoiding a `ss` / `netstat` dependency in the
-// container image.
+// detectAppPort enumerates LISTEN-state TCP sockets from /proc/net/{tcp,tcp6}
+// and returns the first port that's not the daemon's own MCP port. We need
+// to read both because many Node apps (n8n included) bind to "::" (IPv6
+// any) which only appears in tcp6 even though it accepts IPv4 too via
+// IPv4-mapped addresses. Reading /proc avoids a `ss`/`netstat` dependency
+// in the container image.
 func detectAppPort(skipPort int) (int, error) {
-	data, err := os.ReadFile("/proc/net/tcp")
-	if err != nil {
-		return 0, fmt.Errorf("read /proc/net/tcp: %w", err)
+	for _, path := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		if p, ok := scanListenPorts(path, skipPort); ok {
+			return p, nil
+		}
 	}
-	// File layout:
+	return 0, errors.New("no listening port found beyond mcp")
+}
+
+// scanListenPorts reads a /proc/net/{tcp,tcp6} table and returns the first
+// LISTEN-state port that isn't skipPort. Returns (0, false) when none found
+// or the file is unreadable (e.g. tcp6 disabled in the kernel).
+func scanListenPorts(path string, skipPort int) (int, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	// File layout (same for tcp + tcp6):
 	//   sl  local_address rem_address   st ...
 	//   0:  00000000:1622 00000000:0000 0A ...    ← st 0A = LISTEN
 	for i, line := range strings.Split(string(data), "\n") {
@@ -100,23 +114,21 @@ func detectAppPort(skipPort int) (int, error) {
 			continue
 		}
 		portHex := fields[1][colon+1:]
-		decoded, err := hex.DecodeString(portHex)
-		if err != nil || len(decoded) != 2 {
-			// Fall back to ParseInt in case the hex has odd length
+		decoded, derr := hex.DecodeString(portHex)
+		var port int
+		if derr != nil || len(decoded) != 2 {
 			n, perr := strconv.ParseInt(portHex, 16, 32)
 			if perr != nil {
 				continue
 			}
-			if int(n) == skipPort {
-				continue
-			}
-			return int(n), nil
+			port = int(n)
+		} else {
+			port = int(decoded[0])<<8 | int(decoded[1])
 		}
-		port := int(decoded[0])<<8 | int(decoded[1])
 		if port == skipPort {
 			continue
 		}
-		return port, nil
+		return port, true
 	}
-	return 0, errors.New("no listening port found beyond mcp")
+	return 0, false
 }
