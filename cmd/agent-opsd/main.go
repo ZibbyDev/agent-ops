@@ -44,7 +44,7 @@ import (
 )
 
 // version is set via -ldflags by the release pipeline.
-var version = "0.1.1-dev"
+var version = "0.1.11-dev"
 
 func main() {
 	// Subcommand routing: `agent-opsd version` short-circuits config load.
@@ -90,7 +90,13 @@ func run(cfgPath string, logger *slog.Logger) error {
 	// Tools
 	tools := tool.NewRegistry()
 	tools.MustRegister(tool.NewShellTool())
-	// (v0.1 ships shell only; fs/http/docker land in v0.2)
+	// zibby_workflow closes the agent→user comm loop: the LLM can fire
+	// a user-defined Zibby workflow (Slack notify, page on-call, open
+	// Jira ticket, etc.) when shell evidence warrants. The tool is a
+	// no-op when ZIBBY_API_BASE_URL / ZIBBY_PAT_TOKEN / ZIBBY_PROJECT_ID
+	// aren't set, so non-Zibby deployments don't see surprise failures.
+	tools.MustRegister(tool.NewZibbyWorkflowTool())
+	// (v0.1 ships shell + zibby_workflow; fs/http/docker land in v0.2)
 
 	// Driver
 	d, err := buildDriver(cfg)

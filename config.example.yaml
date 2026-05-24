@@ -64,6 +64,17 @@ bootstrap:
 
 # Recurring tasks. Each one fires on its cron expression. Edit names + prompts
 # to taste — agent-ops will reconcile on restart.
+#
+# Tool allowlist:
+#   - `shell`          — POSIX shell on the host. Always available.
+#   - `zibby_workflow` — Trigger a user-defined Zibby Cloud workflow
+#                        (Slack notify, page on-call, open Jira, etc.)
+#                        Requires ZIBBY_API_BASE_URL, ZIBBY_PAT_TOKEN,
+#                        and ZIBBY_PROJECT_ID env vars. When the daemon
+#                        runs inside a Zibby-managed Fargate task the
+#                        platform sets these automatically; outside that
+#                        environment the tool no-ops (so the LLM can
+#                        fall back to logging).
 schedules:
   - name: hourly_health_check
     cron: "0 * * * *"
@@ -71,8 +82,14 @@ schedules:
     # still alive?" is a cheap binary check that doesn't need Sonnet.
     prompt: |
       Verify the application is responding on its expected port.
-      If not, restart the process and re-verify. Report status.
-    tools: [shell]
+      If it's down, try `pkill -SIGHUP <process>` to soft-restart and
+      re-check. If the soft restart doesn't bring it back, call
+      zibby_workflow with workflow="notify-app-down" and input:
+        {"instance_id": "$INSTANCE_ID",
+         "error": "<one-line summary>",
+         "severity": "high"}
+      so the operator gets paged. Report status.
+    tools: [shell, zibby_workflow]
 
   - name: weekly_upgrade
     cron: "0 9 * * 1"        # Mondays 09:00 UTC
@@ -86,5 +103,7 @@ schedules:
         2. Pull the new version.
         3. Run smoke tests.
         4. If anything fails, roll back and explain what went wrong.
+           Then call zibby_workflow with workflow="notify-upgrade-failed"
+           and input describing the failure so the on-call sees it.
         5. If everything passes, summarize what changed.
-    tools: [shell]
+    tools: [shell, zibby_workflow]
