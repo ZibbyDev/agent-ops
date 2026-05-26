@@ -110,9 +110,24 @@ func MaybeRunFirstRun(
 	// Script mode short-circuit. Skips the LLM entirely — `bash -c <script>`
 	// in-process. We still respect cfg.Bootstrap when present (for the
 	// verifier / fact-store), but the script itself runs verbatim from env.
+	//
+	// Catalog scripts often end with a `curl localhost:<port>` smoke test
+	// that's racy against slow-starting apps (gastown, n8n with many nodes,
+	// etc.) — if the script's final smoke-check fails but the declared port
+	// is actually accepting connections, we still register the port and
+	// mark bootstrap successful. The ALB has its own health check + the
+	// agent-ops MCP layer can re-trigger setup later if the app crashes.
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("AGENT_OPS_BOOTSTRAP_MODE")), "script") {
-		if err := runScriptBootstrap(ctx, cfg, store); err != nil {
-			return err
+		scriptErr := runScriptBootstrap(ctx, cfg, store)
+		if scriptErr != nil && !appIsListening(ctx, cfg) {
+			return scriptErr
+		}
+		if scriptErr != nil {
+			slog.Warn("bootstrap: script exited non-zero but app port is open, treating as success",
+				"err", scriptErr.Error())
+			_, _ = store.AddFact(ctx, "bootstrap",
+				"script_exit_nonzero_but_port_open at "+time.Now().UTC().Format(time.RFC3339)+
+					": "+scriptErr.Error())
 		}
 		return finalizeBootstrapSuccess(ctx, cfg, marker)
 	}
@@ -215,6 +230,40 @@ func finalizeBootstrapSuccess(ctx context.Context, cfg *config.Config, marker st
 	return os.WriteFile(marker, []byte("ok"), 0o600)
 	// the marker has no business value beyond "we've been here" — its
 	// presence alone keeps subsequent restarts idempotent.
+}
+
+// appIsListening polls AGENT_OPS_APP_PORT for up to 30s, returning true once
+// something accepts a TCP connect. Used to gracefully recover from buggy
+// catalog smoke tests that race the app's startup (`curl localhost:8080`
+// before the app is bound). When AGENT_OPS_APP_PORT isn't set, falls back
+// to "any listener besides our own MCP port is up".
+func appIsListening(ctx context.Context, cfg *config.Config) bool {
+	mcpPort := parseMCPPort(cfg.MCP.ListenAddr)
+	raw := strings.TrimSpace(os.Getenv("AGENT_OPS_APP_PORT"))
+	var declaredPort int
+	if raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n < 65536 {
+			declaredPort = n
+		}
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if declaredPort > 0 {
+			conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", declaredPort), 1*time.Second)
+			if err == nil {
+				conn.Close()
+				return true
+			}
+		} else if hasNonMCPListener(mcpPort) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return false
 }
 
 // waitForAnyListener polls /proc/net/tcp{,6} until at least one LISTEN port
