@@ -246,7 +246,10 @@ func appIsListening(ctx context.Context, cfg *config.Config) bool {
 			declaredPort = n
 		}
 	}
-	deadline := time.Now().Add(30 * time.Second)
+	// 2-minute budget — gastown, n8n-with-many-nodes, and grafana commonly
+	// take 60-90s to first-bind their HTTP listener after the install script
+	// returns. ALB health checks pick up failures past this point.
+	deadline := time.Now().Add(2 * time.Minute)
 	for time.Now().Before(deadline) {
 		if declaredPort > 0 {
 			conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", declaredPort), 1*time.Second)
