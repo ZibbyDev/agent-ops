@@ -168,18 +168,20 @@ func TestRun_SuccessLogsConversation(t *testing.T) {
 }
 
 func TestRun_TruncatesLongFields(t *testing.T) {
-	// Conversation result over the 4k cap must be truncated so CloudWatch
-	// events stay under the 256KB-per-event limit. Same for prompts (2k
-	// each) and stderr (800).
-	longResult := strings.Repeat("x", 8000)
+	// Truncation caps were bumped in 0.1.19 — the previous 1.5K cap on
+	// system_prompt was clipping users' MISSION + KNOWN FACTS blocks
+	// mid-section in the dashboard. New caps: 8K/4K/8K/0.8K for
+	// system/user/result/stderr. CloudWatch event ceiling is 256KB so
+	// worst-case ~21KB is well under budget.
+	longResult := strings.Repeat("x", 16000)
 	stdoutJSON := `{"result":"` + longResult + `","total_cost_usd":0,"num_turns":1,"is_error":false}`
 	bin := fakeClaudeCLI(t, stdoutJSON, "", 0)
 	logBuf := captureLog(t)
 
 	d := &Driver{Binary: bin}
 	_, err := d.Run(context.Background(), driver.Request{
-		SystemPrompt: strings.Repeat("s", 3000),
-		UserPrompt:   strings.Repeat("u", 4000),
+		SystemPrompt: strings.Repeat("s", 12000),
+		UserPrompt:   strings.Repeat("u", 8000),
 	})
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
@@ -187,17 +189,17 @@ func TestRun_TruncatesLongFields(t *testing.T) {
 
 	convo := findRecord(t, logRecords(t, logBuf), "claudecli: conversation complete")
 
-	// 4k result cap.
-	if got := len(convo["result"].(string)); got > 4000+8 /* "...(8000)" suffix */ {
-		t.Errorf("result length = %d, expected ≈4000-ish (truncated)", got)
+	// 8k result cap.
+	if got := len(convo["result"].(string)); got > 8000+12 /* "...(16000)" suffix room */ {
+		t.Errorf("result length = %d, expected ≈8000-ish (truncated)", got)
 	}
-	// 1.5k system_prompt cap.
-	if got := len(convo["system_prompt"].(string)); got > 1500+8 {
-		t.Errorf("system_prompt length = %d, expected ≈1500-ish (truncated)", got)
+	// 8k system_prompt cap.
+	if got := len(convo["system_prompt"].(string)); got > 8000+12 {
+		t.Errorf("system_prompt length = %d, expected ≈8000-ish (truncated)", got)
 	}
-	// 2k user_prompt cap.
-	if got := len(convo["user_prompt"].(string)); got > 2000+8 {
-		t.Errorf("user_prompt length = %d, expected ≈2000-ish (truncated)", got)
+	// 4k user_prompt cap.
+	if got := len(convo["user_prompt"].(string)); got > 4000+12 {
+		t.Errorf("user_prompt length = %d, expected ≈4000-ish (truncated)", got)
 	}
 }
 

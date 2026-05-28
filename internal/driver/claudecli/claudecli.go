@@ -150,10 +150,19 @@ func (d *Driver) Run(ctx context.Context, req driver.Request) (driver.Result, er
 	// claudecli was *spawned* — not what it produced. Truncated at 4k
 	// to bound CloudWatch event size (events over 256KB get dropped).
 	stderrStr := strings.TrimSpace(stderr.String())
+	// Truncation limits: CloudWatch caps a single log event at 256KB and
+	// drops anything larger. We were previously well under-budget (1.5K +
+	// 2K + 4K + 0.8K + JSON overhead = ~10K) which left users with cut-off
+	// MISSION/KNOWN FACTS blocks in the dashboard. Bumped to roomier
+	// limits that still stay comfortably below the per-event cap:
+	//   system_prompt → 8000  (covers ~40 facts + mission + base guidance)
+	//   user_prompt   → 4000  (covers most schedule prompts in full)
+	//   result        → 8000  (covers most Claude responses in full)
+	// Total worst case ~21KB, well under the 256KB ceiling.
 	slog.Info("claudecli: conversation complete",
-		"system_prompt", truncate(req.SystemPrompt, 1500),
-		"user_prompt", truncate(req.UserPrompt, 2000),
-		"result", truncate(resp.Result, 4000),
+		"system_prompt", truncate(req.SystemPrompt, 8000),
+		"user_prompt", truncate(req.UserPrompt, 4000),
+		"result", truncate(resp.Result, 8000),
 		"num_turns", resp.NumTurns,
 		"total_cost_usd", resp.TotalCostUSD,
 		"is_error", resp.IsError,
