@@ -102,7 +102,26 @@ func MaybeRunFirstRun(
 	}
 	marker := filepath.Join(cfg.StateDir, "bootstrap.done")
 	if _, err := os.Stat(marker); err == nil {
-		return nil // already done
+		// Marker exists from a previous container's bootstrap. BUT marker
+		// just records "install completed once" — it does NOT mean the
+		// app process is currently running. Containers are ephemeral; on
+		// any ECS task restart (upgrade, crash, scale event) the install
+		// on EFS is durable but the launched process is gone.
+		//
+		// If the app's declared port isn't responding, re-run the script.
+		// Catalog install commands (apt-get, npm install, curl downloads)
+		// are idempotent — they no-op when already-installed — and the
+		// trailing launch portion respawns the app.
+		//
+		// Without this, every container restart left agent-ops idle and
+		// the ALB target group went unhealthy (502 / connection refused).
+		if appIsListening(ctx, cfg) {
+			return nil // app is up — really done, skip
+		}
+		slog.Info("bootstrap: marker exists but app port not listening — re-running script (container restart, app process gone with previous container)",
+			"app_port", os.Getenv("AGENT_OPS_APP_PORT"))
+		// fall through to the re-run path. finalizeBootstrapSuccess at
+		// the end of the run will rewrite the marker (idempotent).
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("bootstrap.MaybeRunFirstRun: stat marker: %w", err)
 	}

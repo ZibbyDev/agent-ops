@@ -2,6 +2,8 @@ package bootstrap
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -268,5 +270,115 @@ func TestRunScriptBootstrap_TimeoutKills(t *testing.T) {
 	}
 	if elapsed > 15*time.Second {
 		t.Fatalf("kill took too long: %v", elapsed)
+	}
+}
+
+// MaybeRunFirstRun — when bootstrap.done marker exists from a previous
+// container's run, the function must distinguish "app still serving"
+// (real skip) from "app process died with the previous container"
+// (must re-launch).
+//
+// Without this differentiation, every ECS task restart (upgrade, crash,
+// scale) left agent-ops idle: marker → return early → app never
+// relaunched → ALB target unhealthy.
+
+// listenOnEphemeralPort grabs a free port and returns it + a cleanup.
+// We use this to simulate "app is up" by holding a real TCP listener.
+func listenOnEphemeralPort(t *testing.T) (int, func()) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	return port, func() { _ = l.Close() }
+}
+
+func TestMaybeRunFirstRun_MarkerExistsAndAppListening_SkipsScript(t *testing.T) {
+	dir := t.TempDir()
+	store, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Pre-create the bootstrap.done marker (simulates a previous run).
+	marker := filepath.Join(dir, "bootstrap.done")
+	if err := os.WriteFile(marker, []byte("done"), 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	// Hold a real TCP listener on an ephemeral port. AGENT_OPS_APP_PORT
+	// points at it so appIsListening returns true on the first probe.
+	port, cleanup := listenOnEphemeralPort(t)
+	defer cleanup()
+	t.Setenv("AGENT_OPS_APP_PORT", fmt.Sprintf("%d", port))
+
+	// If the script DID re-run (it shouldn't), it'd create this file.
+	// We assert it doesn't exist at the end.
+	failMarker := filepath.Join(dir, "script-ran-but-should-not")
+	t.Setenv("AGENT_OPS_BOOTSTRAP_MODE", "script")
+	t.Setenv("AGENT_OPS_BOOTSTRAP_SCRIPT",
+		"touch "+failMarker+"; exit 0")
+	t.Setenv("AGENT_OPS_BOOTSTRAP_TIMEOUT", "5s")
+
+	cfg := &config.Config{StateDir: dir}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := MaybeRunFirstRun(ctx, cfg, nil, store); err != nil {
+		t.Fatalf("MaybeRunFirstRun: %v", err)
+	}
+	if _, err := os.Stat(failMarker); err == nil {
+		t.Fatal("script re-ran even though marker existed AND app was listening — should have skipped")
+	}
+}
+
+func TestMaybeRunFirstRun_MarkerExistsButAppDown_ReRunsScript(t *testing.T) {
+	// This is the BUG FIX. Marker present from previous container, but
+	// the app process died with that container — port returns refused /
+	// times out. Bootstrap must re-run the script to respawn the app
+	// (install commands inside the script are idempotent).
+	dir := t.TempDir()
+	store, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Pre-create marker.
+	marker := filepath.Join(dir, "bootstrap.done")
+	if err := os.WriteFile(marker, []byte("done"), 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	// Point AGENT_OPS_APP_PORT at a port nothing is listening on, so
+	// appIsListening returns false. Grab an ephemeral port AND close
+	// the listener so the OS marks it free, then use that port number.
+	port, cleanup := listenOnEphemeralPort(t)
+	cleanup() // close immediately so nothing answers
+	t.Setenv("AGENT_OPS_APP_PORT", fmt.Sprintf("%d", port))
+
+	// If the script DOES re-run (it should), this marker appears.
+	successMarker := filepath.Join(dir, "script-actually-re-ran")
+	t.Setenv("AGENT_OPS_BOOTSTRAP_MODE", "script")
+	t.Setenv("AGENT_OPS_BOOTSTRAP_SCRIPT",
+		"touch "+successMarker+"; exit 0")
+	t.Setenv("AGENT_OPS_BOOTSTRAP_TIMEOUT", "5s")
+
+	cfg := &config.Config{StateDir: dir}
+	// appIsListening polls for 2 minutes by design (slow apps). Tests
+	// must beat that with a tight cancellation budget — port is closed,
+	// so all probes fail immediately, but the deadline is what shortens
+	// each attempt. We use a context that's tight enough that even with
+	// the listener-up path, the function returns quickly.
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+
+	if err := MaybeRunFirstRun(ctx, cfg, nil, store); err != nil {
+		t.Fatalf("MaybeRunFirstRun: %v", err)
+	}
+	if _, err := os.Stat(successMarker); err != nil {
+		t.Fatalf("script did NOT re-run even though app port was down — bootstrap.done was incorrectly treated as 'app is up': %v", err)
 	}
 }
