@@ -218,6 +218,10 @@ async function listDebsInBucket({ bucket }) {
     // .deb files end up under the prefix.
     const base = path.posix.basename(key);
     if (!/^agent-ops_[0-9][^_]*_(linux)_(amd64|arm64)\.deb$/.test(base)) continue;
+    // Skip alias copies under agent-ops/latest/ — the canonical source is
+    // agent-ops/v<ver>/. Without this filter every deb would be discovered
+    // twice and downloaded twice into the same pool/ slot.
+    if (key.startsWith(`${DEFAULTS.s3SrcPrefix}/latest/`)) continue;
     debs.push({ key, base });
   }
   return debs;
@@ -461,12 +465,15 @@ async function main() {
         fs.writeFileSync(packagesGzPath, '');
         continue;
       }
-      const out = await runCommand('apt-ftparchive', ['--arch', arch, 'packages', 'pool/'], { capture: true, env: { ...process.env }, stdioErr: 'inherit' });
+      // Pass the absolute staging-pool path: runCommand's default cwd is
+      // repoRoot, which has no `pool/` of its own. apt-ftparchive then
+      // emits absolute Filename: lines that we rewrite to be repo-relative
+      // below.
+      const poolAbs = path.join(stagingDir, 'pool');
+      const out = await runCommand('apt-ftparchive', ['--arch', arch, 'packages', poolAbs], { capture: true, env: { ...process.env }, stdioErr: 'inherit' });
       // Rewrite Filename: prefix so absolute paths in the staging dir
-      // become relative repo paths (apt-ftparchive emits them relative to
-      // the cwd it was invoked in, which is the staging root via `cwd`).
-      // We invoked from repoRoot, so the paths come out as e.g.
-      // "/tmp/agent-ops-apt-…/pool/main/a/agent-ops/agent-ops_…deb".
+      // become relative repo paths (apt-ftparchive emits them with the
+      // prefix it was given, i.e. the absolute poolAbs).
       const stagingPrefix = stagingDir.endsWith('/') ? stagingDir : `${stagingDir}/`;
       const normalised = out.replaceAll(stagingPrefix, '');
       fs.writeFileSync(packagesPath, normalised, 'utf8');
