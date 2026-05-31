@@ -154,7 +154,14 @@ checksum:
   algorithm: sha256
 
 snapshot:
-  version_template: "{{ incpatch .Version }}-next"
+  # Use the exact tag version (e.g. v0.2.1 → 0.2.1) when GORELEASER_CURRENT_TAG
+  # is set, so local snapshot builds produce artifacts under the same version
+  # the publish scripts will upload to dl.zibby.app. The old template
+  # ("{{ incpatch .Version }}-next") added a "-next" suffix that broke
+  # `agent-ops/v<ver>/` S3 layout — we'd publish v0.2.2-next when the real
+  # release was meant to be 0.2.1. Fall back to inc-patch for `goreleaser
+  # release --snapshot` runs without an explicit tag (CI smoke tests, etc).
+  version_template: "{{ .Version }}"
 
 changelog:
   use: github
