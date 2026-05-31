@@ -27,8 +27,10 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/ZibbyHQ/agent-ops/examples"
 	"github.com/ZibbyHQ/agent-ops/internal/scheduler"
 	"github.com/ZibbyHQ/agent-ops/internal/state"
 	"github.com/ZibbyHQ/agent-ops/internal/tool"
@@ -58,6 +60,13 @@ type Server struct {
 	token     string // bearer; New refuses to build a Server with an empty token
 	log       *slog.Logger
 
+	// configPath is the on-disk config.yaml the daemon was started with.
+	// Empty when the Server was constructed without one (e.g. unit-tests
+	// that don't exercise template-write paths) — in that case the
+	// agent_apply_template tool returns an error pointing the caller at
+	// agent-ops init --template instead.
+	configPath string
+
 	// allowedOrigins is the set of Origin header values acceptable on
 	// cross-origin browser requests. Requests with no Origin header are
 	// allowed through (non-browser clients). See validateOrigin.
@@ -74,6 +83,11 @@ type Config struct {
 	Tools     *tool.Registry
 	Token     string
 	Logger    *slog.Logger
+
+	// ConfigPath is the daemon's on-disk YAML config (the same path passed
+	// to `agent-opsd --config`). Optional — leave empty in tests that don't
+	// exercise agent_apply_template; the daemon supplies it from cfgPath.
+	ConfigPath string
 
 	ServerName    string
 	ServerVersion string
@@ -107,6 +121,7 @@ func New(c Config) (*Server, error) {
 		tools:          c.Tools,
 		token:          c.Token,
 		log:            logger,
+		configPath:     c.ConfigPath,
 		allowedOrigins: loadAllowedOrigins(),
 		serverName:     name,
 		serverVersion:  ver,
@@ -362,6 +377,12 @@ func (s *Server) handleToolsCall(w http.ResponseWriter, ctx context.Context, req
 		s.toolRememberFact(w, ctx, req.ID, params.Arguments)
 	case "fact_inspect":
 		s.toolFactInspect(w, ctx, req.ID, params.Arguments)
+	case "agent_list_templates":
+		s.respond(w, req.ID, s.toolListTemplates())
+	case "agent_get_template":
+		s.toolGetTemplate(w, req.ID, params.Arguments)
+	case "agent_apply_template":
+		s.toolApplyTemplate(w, req.ID, params.Arguments)
 	default:
 		writeJSONRPCError(w, req.ID, -32602, "no such tool: "+params.Name)
 	}
@@ -607,6 +628,122 @@ func (s *Server) toolSetTask(w http.ResponseWriter, ctx context.Context, id any,
 	s.respond(w, id, toolTextResult("ok"))
 }
 
+// ─── Bundled config templates ──────────────────────────────────────────────
+
+// toolListTemplates returns the bundled template metadata as a structured
+// JSON payload (mirrors the CLI's --list-templates table). The MCP wrapper
+// stuffs it into a text-content block so any MCP client can render it.
+func (s *Server) toolListTemplates() map[string]any {
+	all := examples.List()
+	rows := make([]map[string]any, 0, len(all))
+	for _, t := range all {
+		rows = append(rows, map[string]any{
+			"name":        t.Name,
+			"description": t.Description,
+			"filename":    t.Filename,
+		})
+	}
+	return toolTextResult(mustEncodeJSON(map[string]any{
+		"templates": rows,
+		"count":     len(rows),
+	}))
+}
+
+// toolGetTemplate returns the raw YAML body of one bundled template. The
+// caller is expected to display it to the operator and (after review)
+// invoke agent_apply_template — we explicitly don't write here so a misuse
+// of "get" doesn't clobber the daemon's config.
+func (s *Server) toolGetTemplate(w http.ResponseWriter, id any, raw json.RawMessage) {
+	var args struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		writeJSONRPCError(w, id, -32602, "bad args: "+err.Error())
+		return
+	}
+	if args.Name == "" {
+		s.respond(w, id, toolErrorResult("name is required"))
+		return
+	}
+	body, err := examples.Get(args.Name)
+	if err != nil {
+		// examples.Get already lists the available names in its error.
+		s.respond(w, id, toolErrorResult(err.Error()))
+		return
+	}
+	s.respond(w, id, toolTextResult(string(body)))
+}
+
+// toolApplyTemplate writes a bundled template to the daemon's configured
+// config.yaml path. Always returns restart_required:true — the daemon
+// does NOT hot-reload its config (no SIGHUP handler in v0.2); the operator
+// has to `agent-ops restart` to pick up the new file. dry_run:true
+// short-circuits the write so a remote agent can preview before
+// committing.
+//
+// Failure modes (all surfaced as isError:true tool results, not JSON-RPC
+// errors, so the LLM caller sees the human-readable message):
+//   - unknown template name
+//   - server constructed without ConfigPath (e.g. test harness)
+//   - filesystem write fails (perm denied / disk full)
+func (s *Server) toolApplyTemplate(w http.ResponseWriter, id any, raw json.RawMessage) {
+	var args struct {
+		Name   string `json:"name"`
+		DryRun bool   `json:"dry_run"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		writeJSONRPCError(w, id, -32602, "bad args: "+err.Error())
+		return
+	}
+	if args.Name == "" {
+		s.respond(w, id, toolErrorResult("name is required"))
+		return
+	}
+	body, err := examples.Get(args.Name)
+	if err != nil {
+		s.respond(w, id, toolErrorResult(err.Error()))
+		return
+	}
+
+	if s.configPath == "" {
+		s.respond(w, id, toolErrorResult(
+			"daemon was constructed without a config path; "+
+				"have the operator run `agent-ops init --template "+args.Name+"` instead"))
+		return
+	}
+
+	res := map[string]any{
+		"name":             args.Name,
+		"path":             s.configPath,
+		"restart_required": true,
+		"bytes":            len(body),
+	}
+
+	if args.DryRun {
+		res["ok"] = true
+		res["dry_run"] = true
+		s.respond(w, id, toolTextResult(mustEncodeJSON(res)))
+		return
+	}
+
+	if err := os.MkdirAll(filepath.Dir(s.configPath), 0o755); err != nil {
+		s.respond(w, id, toolErrorResult("mkdir config dir: "+err.Error()))
+		return
+	}
+	if err := os.WriteFile(s.configPath, body, 0o644); err != nil {
+		s.respond(w, id, toolErrorResult("write config: "+err.Error()))
+		return
+	}
+
+	s.log.Info("mcp: applied bundled template",
+		"name", args.Name, "path", s.configPath, "bytes", len(body))
+
+	res["ok"] = true
+	res["dry_run"] = false
+	res["next_step"] = "run `agent-ops restart` (or your platform's equivalent) — config is not hot-reloaded"
+	s.respond(w, id, toolTextResult(mustEncodeJSON(res)))
+}
+
 // ─── JSON-RPC plumbing ─────────────────────────────────────────────────────
 
 type jsonRPCRequest struct {
@@ -730,6 +867,26 @@ func builtinTools() []builtin {
 			name:        "fact_inspect",
 			description: "Return the unfiltered text of a KNOWN FACT from the system prompt. The system prompt filters npm-warn noise from facts by default; if you need to see the dropped lines (e.g., to diagnose why a bootstrap exited 7 when the visible facts only show generic warns), call this with the fact's `<index>` from its rendered hint. Index 0 = most recent fact, increases backward.",
 			schema:      `{"type":"object","properties":{"index":{"type":"integer","minimum":0}},"required":["index"]}`,
+		},
+		// ── Bundled config templates ──────────────────────────────────────
+		// These three mirror the `agent-ops init --template …` CLI surface
+		// over MCP so a remote agent (e.g. the user's Claude Code) can pick
+		// a starting config without the operator typing YAML by hand. See
+		// internal/examples for the embedded template set.
+		{
+			name:        "agent_list_templates",
+			description: "List the config.yaml templates bundled into the agent-ops binary. Returns each template's name + one-line description. Use BEFORE agent_get_template / agent_apply_template so you know which template name to ask for. No arguments.",
+			schema:      `{"type":"object","properties":{}}`,
+		},
+		{
+			name:        "agent_get_template",
+			description: "Return the raw YAML body of one bundled config template by name (use agent_list_templates to discover names). Read-only — does NOT modify the daemon's config. Pair this with agent_apply_template when the operator has reviewed the YAML and wants to install it.",
+			schema:      `{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}`,
+		},
+		{
+			name:        "agent_apply_template",
+			description: "Overwrite the daemon's config.yaml with a bundled template. Always presents the operator with a restart_required:true in the response — the daemon does NOT hot-reload config in v0.2; the operator must `agent-ops restart` for changes to take effect. Set dry_run:true to preview without writing.",
+			schema:      `{"type":"object","properties":{"name":{"type":"string"},"dry_run":{"type":"boolean"}},"required":["name"]}`,
 		},
 	}
 }

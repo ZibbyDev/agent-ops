@@ -1,0 +1,175 @@
+# Example config — Node.js server behind nginx, PM2-managed.
+#
+# Drop this in /etc/agent-ops/config.yaml when your host runs a single
+# Node.js application (Express / Fastify / Next.js / NestJS) under PM2,
+# fronted by nginx as a reverse proxy with Let's Encrypt TLS:
+#
+#   nginx   -> reverse-proxies :443 to the Node process on :3000
+#   pm2     -> keeps `node server.js` alive, captures logs to ~pm2/.pm2/logs/
+#   certbot -> Let's Encrypt cert for the ServerName
+#
+# Tuned for small droplets (1-2 GB RAM): cheap Haiku for routine checks,
+# Sonnet for the weekly security patch where reasoning matters. Cost
+# ≈ $0.15-0.30 / day at this cadence depending on restart frequency.
+#
+# Assumes you've ALREADY installed Node + PM2 + nginx and the app is
+# running. agent-ops keeps it alive — it doesn't bootstrap the stack.
+#
+# After copying:
+#   1. Edit the `APP_NAME=` and `APP_URL=` lines in the schedules below.
+#   2. Confirm `pm2 list` shows your app under the same user the daemon
+#      runs as (or set `sudo -u <appuser> pm2 ...` in the prompts).
+#   3. (Optional) Set AGENT_OPS_NOTIFY_WORKFLOW_ID for Lark / Slack pings.
+#   4. `sudo agent-ops restart`
+
+state_dir: /var/lib/agent-ops
+
+agent:
+  provider: claude-cli
+  model: claude-haiku-4-5-20251001    # cheap default — routine cron checks
+  api_key_env: ANTHROPIC_API_KEY      # ignored when provider=claude-cli
+  max_tool_calls_per_task: 25
+  task_timeout: 15m
+
+mcp:
+  listen_addr: "127.0.0.1:7842"
+  token_env: AGENT_OPS_TOKEN
+
+# No first-run bootstrap — assumes Node + PM2 + nginx are already
+# installed and running. agent-ops is here to KEEP the app alive.
+
+schedules:
+  # ─── Every 5 minutes: app + reverse-proxy liveness with auto-heal ───
+  # Tight cadence so a crashed Node worker doesn't drop traffic for long.
+  # PM2 already auto-restarts on crash; this checks PM2 ITSELF is healthy
+  # AND that nginx is reaching the upstream.
+  - name: liveness_check
+    cron: "*/5 * * * *"
+    prompt: |
+      Verify the Node.js app stack is healthy. Use the shell tool only;
+      no human in the loop, autonomous mode — discover via `pm2 list`,
+      `systemctl`, `curl`.
+
+      APP_NAME="my-node-app"
+      APP_URL="https://example.com/healthz"
+      UPSTREAM_PORT=3000
+
+      Checks (in this order — short-circuit on first hard failure):
+        1. `pm2 jlist | jq -r '.[] | select(.name=="'"$APP_NAME"'") |
+           .pm2_env.status'` returns "online". If "stopped" / "errored":
+           `pm2 restart $APP_NAME`, wait 5 seconds, re-check. If still
+           not "online", escalate (notify) and stop.
+        2. nginx is running. If not: `systemctl restart nginx`, verify,
+           report. If restart fails, escalate and stop.
+        3. `curl -sk -o /dev/null -w "%{http_code}" -m 8 $APP_URL`.
+           Anything not 2xx/3xx for two consecutive runs (check state at
+           /var/lib/agent-ops/last-status.json — create if missing): try
+           `pm2 reload $APP_NAME` (zero-downtime), re-check, report.
+        4. `ss -ltn | grep ":$UPSTREAM_PORT "` — confirms Node is
+           actually listening. If absent: `pm2 restart $APP_NAME`,
+           verify, report.
+
+      Report exactly one line per check: "<check>: <ok|fixed|failed>: <evidence>".
+      Notification: if anything escalates, shell-out to your notify CLI
+      (e.g. `zibby workflow trigger $AGENT_OPS_NOTIFY_WORKFLOW_ID
+      --input severity=high --input msg="<one-line>"`). No CLI installed
+      → just log; the operator will see it on `agent-ops logs`.
+    tools: [shell]
+
+  # ─── Hourly: deeper system health (memory, disk, PM2 restart loops) ──
+  - name: system_health
+    cron: "0 * * * *"
+    prompt: |
+      Diagnose the host's vital signs and self-heal common housekeeping
+      issues. Autonomous mode — no questions.
+
+      APP_NAME="my-node-app"
+
+      Inspect (read-only first, then act):
+        - `free -m`. If MemAvailable < 100 MB AND `$APP_NAME`'s
+          PM2-reported memory is the largest non-system process:
+          `pm2 reload $APP_NAME` (graceful, no downtime). Re-check.
+        - `df -h /`. If / >= 90% used: rotate PM2 logs
+          (`pm2 flush $APP_NAME`), rotate nginx logs
+          (`logrotate -f /etc/logrotate.d/nginx`), purge
+          /var/cache/apt/archives via `apt-get clean`. If still >= 85%,
+          enumerate the top 10 largest directories under /home,
+          /var/log/, ~pm2/.pm2/logs/ and REPORT — do not delete user
+          data without escalation.
+        - `pm2 jlist | jq -r '.[] | select(.name=="'"$APP_NAME"'") |
+          .pm2_env.restart_time'`. If restart_time grew by > 5 since
+          the last hour (track in /var/lib/agent-ops/restart-counter.json,
+          create if missing), the app is in a crash loop. Capture the
+          last 200 lines of `pm2 logs $APP_NAME --lines 200 --nostream`
+          and notify — do NOT keep restarting; the operator needs to
+          look at the trace.
+        - `top -bn1 | head -20`. If a single node worker is > 80% CPU
+          for the snapshot AND CPU stays high after 30 seconds (sample
+          twice), capture its PID + heap snapshot path hint and notify.
+          Don't kill — could be legitimate batch work.
+
+      Report one line per check + any actions taken. Notify on any
+      action OR any unresolved high-severity finding.
+    tools: [shell]
+
+  # ─── Daily 02:30: dependency audit + cert + log housekeeping ────────
+  - name: daily_audit
+    cron: "30 2 * * *"
+    model: claude-sonnet-4-6     # reasoning bump for audit work
+    prompt: |
+      Daily audit. Autonomous, no questions.
+
+      APP_DIR="/var/www/my-node-app"
+
+      Dependency audit (read-only):
+        - `cd $APP_DIR && npm audit --json --omit=dev 2>/dev/null`.
+          Parse the JSON; if there are advisories of severity
+          "high" or "critical", report them with package name,
+          severity, and the fix recommendation. Do NOT run
+          `npm audit fix` — dependency upgrades are an operator
+          decision, not a cron one.
+
+      SSL cert renewal:
+        - `certbot certificates 2>&1` — for each cert with `VALID:
+          <days>` < 21, run `certbot renew --quiet --post-hook
+          "systemctl reload nginx"` and re-verify. Report which renewed.
+
+      PM2 log + dump housekeeping:
+        - `pm2 jlist | jq -r '.[] | .pm2_env.pm_out_log_path'` —
+          if any log file is > 500 MB, `pm2 flush <name>` it.
+        - Check `~pm2/.pm2/dump.pm2` exists (so PM2 will restore the
+          app on reboot). If missing: `pm2 save` to write it.
+
+      Report findings + actions. Notify on any high/critical advisory
+      OR any failure.
+    tools: [shell]
+
+  # ─── Weekly Sunday 04:00: security updates ──────────────────────────
+  # Conservative: ONLY security-marked updates, never full dist-upgrade,
+  # never `npm update` (semver breakage risk). Reboot is operator-only.
+  - name: weekly_security_patch
+    cron: "0 4 * * 0"
+    model: claude-sonnet-4-6
+    prompt: |
+      Apply Ubuntu/Debian security updates ONLY. Autonomous, conservative.
+      Do NOT touch npm dependencies — those are an explicit operator call.
+
+      APP_NAME="my-node-app"
+
+      Steps:
+        1. `apt-get update`.
+        2. `apt list --upgradable 2>/dev/null | grep -i "\-security"`.
+           If none: report "no security updates" and stop.
+        3. Snapshot package list to
+           /var/log/agent-ops/pre-patch-$(date +%F).list.
+        4. `apt-get -y -o Dpkg::Options::="--force-confold" upgrade \
+              $(apt list --upgradable 2>/dev/null | grep -i "\-security" \
+              | awk -F/ '{print $1}')`.
+        5. `systemctl reload nginx` and `pm2 reload $APP_NAME`
+           (graceful). Re-run the liveness checks (curl + pm2 status).
+           If anything broke: report stack trace + STOP, do NOT roll
+           back automatically — escalate to operator.
+        6. If `/var/run/reboot-required` exists: notify operator with
+           "reboot required for kernel update — schedule via `agent-ops
+           schedule run reboot`". Do NOT reboot automatically.
+    tools: [shell]

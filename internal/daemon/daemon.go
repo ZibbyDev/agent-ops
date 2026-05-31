@@ -122,6 +122,7 @@ func Run(cfgPath, version string, logger *slog.Logger) error {
 		Tools:         tools,
 		Token:         tok,
 		Logger:        logger,
+		ConfigPath:    cfgPath,
 		ServerName:    "agent-ops",
 		ServerVersion: version,
 	})

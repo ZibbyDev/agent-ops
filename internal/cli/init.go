@@ -11,10 +11,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/ZibbyHQ/agent-ops/examples"
 	"github.com/ZibbyHQ/agent-ops/internal/service"
 )
 
@@ -36,13 +38,23 @@ func newInitCmd() *cobra.Command {
 		Short: "Interactive setup — write config + install the service.",
 		Long: `Walks you through picking an LLM provider, supplying an API-key
 env var name, and writing /etc/agent-ops/config.yaml. With --dry-run
-nothing is written; the rendered config + unit file are printed.`,
+nothing is written; the rendered config + unit file are printed.
+
+Skip the wizard with a bundled template:
+
+  agent-ops init --list-templates                       # show available templates
+  agent-ops init --template wordpress-multisite --yes   # write the template, no prompts
+  agent-ops init --template single-app --dry-run        # preview without writing`,
 		RunE: runInit,
 	}
 	c.Flags().Bool("dry-run", false,
 		"don't write anything; print what would be written")
 	c.Flags().Bool("yes", false,
 		"non-interactive — accept all defaults (provider=claude-cli, no bootstrap, no notify)")
+	c.Flags().String("template", "",
+		"write a bundled config template instead of running the wizard (see --list-templates)")
+	c.Flags().Bool("list-templates", false,
+		"print the available bundled templates and exit")
 	return c
 }
 
@@ -61,6 +73,23 @@ func runInit(cmd *cobra.Command, _ []string) error {
 	cfgPath, _ := cmd.Flags().GetString("config")
 	dry, _ := cmd.Flags().GetBool("dry-run")
 	yes, _ := cmd.Flags().GetBool("yes")
+	tmpl, _ := cmd.Flags().GetString("template")
+	listTmpls, _ := cmd.Flags().GetBool("list-templates")
+
+	out := cmd.OutOrStdout()
+
+	// --list-templates is a pure read; it short-circuits before any other
+	// logic so it stays safe to run as a non-root operator.
+	if listTmpls {
+		return printTemplateList(out)
+	}
+
+	// --template <name> bypasses the interactive wizard entirely. We still
+	// honour --dry-run / --yes / --config; everything else (provider /
+	// model / bootstrap prompts) is whatever the template author wrote.
+	if tmpl != "" {
+		return runInitFromTemplate(cmd, tmpl, cfgPath, dry, yes)
+	}
 
 	ans := initAnswers{
 		Provider:   "claude-cli",
@@ -70,7 +99,6 @@ func runInit(cmd *cobra.Command, _ []string) error {
 		ConfigPath: cfgPath,
 	}
 
-	out := cmd.OutOrStdout()
 	in := bufio.NewReader(cmd.InOrStdin())
 
 	if !yes {
@@ -267,6 +295,74 @@ func findDaemonBinary() string {
 		return p
 	}
 	return "agent-opsd"
+}
+
+// printTemplateList renders the bundled templates as an aligned 2-column
+// table — name, then description — sorted by name. Pure read; no side
+// effects beyond stdout.
+func printTemplateList(out io.Writer) error {
+	all := examples.List()
+	if len(all) == 0 {
+		// Embed FS is empty — should be unreachable in a built binary, but
+		// don't crash on the bare go-run path.
+		fmt.Fprintln(out, "(no bundled templates)")
+		return nil
+	}
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tDESCRIPTION")
+	for _, t := range all {
+		fmt.Fprintf(tw, "%s\t%s\n", t.Name, t.Description)
+	}
+	return tw.Flush()
+}
+
+// runInitFromTemplate handles `agent-ops init --template <name>`. Pulls
+// the bytes from the embed FS, refuses to clobber an existing config
+// unless --yes (and in that case prints a unified-diff-style preview so
+// the operator can see what changed), and writes to cfgPath. With
+// --dry-run we never touch the filesystem; the template content goes
+// straight to stdout.
+func runInitFromTemplate(cmd *cobra.Command, name, cfgPath string, dry, yes bool) error {
+	out := cmd.OutOrStdout()
+	in := bufio.NewReader(cmd.InOrStdin())
+
+	body, err := examples.Get(name)
+	if err != nil {
+		// examples.Get already includes "Available templates: …" in its
+		// error string; bubble it up unchanged. Exit code 1 via cobra.
+		return err
+	}
+
+	if dry {
+		fmt.Fprintln(out, "--- "+cfgPath+" (template: "+name+") ---")
+		fmt.Fprint(out, string(body))
+		return nil
+	}
+
+	if _, err := os.Stat(cfgPath); err == nil {
+		// Existing config — show a brief diff hint, then prompt unless
+		// --yes was passed (operator-mode: idempotent overwrite).
+		if !yes {
+			fmt.Fprintf(out, "%s already exists.\n", cfgPath)
+			fmt.Fprintln(out, "Re-run with --dry-run to preview the template, or --yes to overwrite.")
+			confirm := promptDefault(in, out, "Overwrite with template "+name+"? [y/N]", "N")
+			if !strings.EqualFold(strings.TrimSpace(confirm), "y") {
+				fmt.Fprintln(out, "Aborted; existing config kept.")
+				return nil
+			}
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+		return fmt.Errorf("init: mkdir config dir: %w", err)
+	}
+	if err := os.WriteFile(cfgPath, body, 0o644); err != nil {
+		return fmt.Errorf("init: write config: %w", err)
+	}
+	fmt.Fprintln(out, "wrote "+cfgPath+" from template "+name)
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Next: edit the template's placeholders (SITES=, APP_URL=, …) and `sudo agent-ops restart`.")
+	return nil
 }
 
 func defaultStateDir() string {

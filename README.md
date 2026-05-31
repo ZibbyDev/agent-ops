@@ -80,6 +80,32 @@ docker run -d \
 
 ---
 
+## Choose a starting template
+
+`agent-ops` ships three bundled config templates so you don't have to
+write YAML by hand. Pick the one closest to your stack — every template
+includes liveness checks, housekeeping, and weekly security patching;
+they differ in the web stack they target and how they discover sites.
+
+| Template | Best for | Highlights |
+|---|---|---|
+| `single-app` | One WordPress + MySQL site on a budget VPS | Hourly liveness, nightly mysqldump, weekly `-security` updates |
+| `wordpress-multisite` | Apache + multiple WordPress installs on one host | 5-min per-site curl + auto-heal, daily cert renewal + WP integrity scan |
+| `nodejs-server` | Single Node.js app under PM2, nginx in front | PM2 health + crash-loop detection, `npm audit`, log rotation |
+
+```bash
+agent-ops init --list-templates                       # see them all
+agent-ops init --template wordpress-multisite --yes   # write straight to /etc/agent-ops/config.yaml
+agent-ops init --template single-app --dry-run        # preview without writing
+```
+
+Each template's source is in [`examples/`](./examples) — readable on
+GitHub, embedded in the binary so the CLI works offline. If you're
+driving the daemon from a remote AI agent (Claude Code, Cursor, …), the
+MCP server exposes the same surface via `agent_list_templates`,
+`agent_get_template`, and `agent_apply_template` — see the MCP table
+below.
+
 ## Quickstart
 
 After install, three commands set up the daemon under systemd (Linux) or
@@ -132,60 +158,13 @@ That example covers all of:
 Copy it in place of `config.yaml`, edit the `SITES=` / `DBS=` lines for
 your domains, `agent-ops restart`. Done.
 
-Below is the minimal stripped-down equivalent for a single-app host (drop
-this at `/etc/agent-ops/config.yaml` if you don't need the multi-site
-machinery):
-
-```yaml
-state_dir: /var/lib/agent-ops
-
-agent:
-  provider: claude-cli
-  model: claude-sonnet-4-6
-  api_key_env: CLAUDE_CODE_OAUTH_TOKEN
-  max_tool_calls_per_task: 30
-  task_timeout: 15m
-
-mcp:
-  listen_addr: ":7842"
-  token_env: AGENT_OPS_TOKEN
-
-schedules:
-  - name: hourly_health_check
-    cron: "0 * * * *"
-    prompt: |
-      Verify the WordPress site is responding on port 80 and the MySQL
-      daemon is accepting connections on 3306. If WP is down:
-        1. Check `systemctl status nginx php8.2-fpm mysql`.
-        2. Restart the failed unit with `systemctl restart <name>`.
-        3. Re-curl the site to confirm it's back.
-      If MySQL is down: try restart once; if it doesn't come back,
-      page the operator via the notify-app-down webhook.
-    tools: [shell]
-
-  - name: nightly_db_backup_verify
-    cron: "30 3 * * *"
-    prompt: |
-      Run `mysqldump -u root --all-databases > /var/backups/mysql-$(date +%F).sql`
-      then verify the dump is non-empty and contains the wp_posts table.
-      Rotate dumps older than 14 days. Report the dump size.
-    tools: [shell]
-
-  - name: weekly_security_update
-    cron: "0 4 * * 0"      # Sundays 04:00 UTC
-    prompt: |
-      Run `apt update && apt list --upgradable`. Install all security
-      patches (`apt upgrade -y --only-upgrade $(apt list --upgradable
-      2>/dev/null | grep -i security | cut -d/ -f1)`). After upgrade,
-      curl the WordPress site once to make sure nothing broke. If it
-      did, summarize what package(s) were upgraded and what's broken.
-    tools: [shell]
-```
-
-Then:
+Don't need the multi-site machinery? Use the stripped-down equivalent —
+[`examples/single-app.yaml`](./examples/single-app.yaml) — which covers
+the same three jobs (liveness, nightly mysqldump, weekly security
+patches) for a one-site WordPress + MySQL + Nginx host:
 
 ```bash
-sudo agent-ops init      # accept defaults (since config exists, it'll ask before overwriting)
+sudo agent-ops init --template single-app --yes   # writes /etc/agent-ops/config.yaml
 sudo agent-ops start
 ```
 
@@ -249,6 +228,7 @@ chat (Claude Code, Cursor, Codex CLI, Gemini CLI) at it:
 | `agent_run_now` | Trigger an ad-hoc run |
 | `agent_history` | Recent runs |
 | `agent_logs` | Per-line log of one run |
+| `agent_list_templates` / `agent_get_template` / `agent_apply_template` | Pick + install a bundled config template (mirrors `agent-ops init --template`) |
 | `host_shell` | Direct shell exec (skip the LLM) |
 
 ---
