@@ -32,7 +32,6 @@ package mcpclient
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sync"
 )
@@ -112,9 +111,6 @@ type Config struct {
 	// MaxBackoff caps the restart delay for crashed stdio subprocesses.
 	// Zero → package default (30s).
 	MaxBackoff int
-
-	// Optional clock override for tests. Nil → real clock.
-	now func() int64
 }
 
 // New builds a Client for the given Config. Returns an error for unknown
@@ -229,7 +225,3 @@ func callToolParams(name string, args json.RawMessage) json.RawMessage {
 	return b
 }
 
-// errUnexpectedShape is returned when a response is well-formed JSON-RPC but
-// has a payload we don't understand. Tests use this to assert wire-format
-// stability between client and (in-process fake) server.
-var errUnexpectedShape = errors.New("mcp: unexpected response shape")
