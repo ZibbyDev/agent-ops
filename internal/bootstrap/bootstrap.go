@@ -90,10 +90,19 @@ func newToken() (string, error) {
 //     scheduler/claudecli path as agent-mode. Falls between script-mode
 //     (zero LLM, brittle) and goal-mode (full LLM, expensive). See
 //     cheatsheet.go for the prompt template + budget enforcement.
-//   - "agent" (default, or empty) — original path: hand cfg.Bootstrap.Prompt
-//     to the configured agent driver and let it use shell tools to think
-//     its way through. Still required for free-form `zibby_deploy_app
-//     --goal="..."` invocations and for non-catalog use of agent-ops.
+//   - "agent" (legacy, default, or empty) — original path: hand
+//     cfg.Bootstrap.Prompt to the configured agent driver and let it use
+//     shell tools to think its way through. Retained behind the backend's
+//     LEGACY_GOAL_MODE escape hatch for safety / rollback; new goal-mode
+//     deploys ship as "agent_script" instead.
+//   - "agent_script" (0.3.8+) — phase-split plan/apply for free-form goals.
+//     Phase 1: claudecli subprocess writes /tmp/install.sh with Bash
+//     DISABLED (Write,Read only). Phase 2: agent-ops execs the script
+//     natively. Phase 3 (on failure): feed stderr/stdout back to Phase 1
+//     and retry, up to AGENT_OPS_BOOTSTRAP_MAX_ITERATIONS (default 5).
+//     This is the replacement for "agent" mode that side-steps the
+//     claude-code CLI's auto-background behavior on long-running Bash
+//     calls — Claude never invokes Bash here, so it can't auto-background.
 //
 // On every path the post-bootstrap port-register handshake + marker file
 // write are identical — they all run through finalizeBootstrapSuccess.
@@ -105,7 +114,8 @@ func MaybeRunFirstRun(
 ) error {
 	if cfg.Bootstrap == nil &&
 		strings.TrimSpace(os.Getenv("AGENT_OPS_BOOTSTRAP_SCRIPT")) == "" &&
-		!isCheatsheetMode() {
+		!isCheatsheetMode() &&
+		!isAgentScriptMode() {
 		return nil
 	}
 	marker := filepath.Join(cfg.StateDir, "bootstrap.done")
@@ -177,6 +187,29 @@ func MaybeRunFirstRun(
 				"err", runErr.Error())
 			_, _ = store.AddFact(ctx, "cheatsheet",
 				"agent_errored_but_port_open at "+time.Now().UTC().Format(time.RFC3339)+
+					": "+runErr.Error())
+		}
+		return finalizeBootstrapSuccess(ctx, cfg, marker)
+	}
+
+	// Agent-script mode (0.3.8+) — phase-split plan/apply. Planner Claude
+	// subprocess runs with Bash DISABLED (Write,Read only) and emits a
+	// /tmp/install.sh script; agent-ops execs it natively with no LLM in
+	// the install loop, so the claude-code CLI's auto-background problem
+	// (the whole reason this mode exists) cannot surface. Same
+	// final-state contract as the other modes: open port wins over agent
+	// self-reported failure, and we finalize bootstrap once the script
+	// path declares success.
+	if isAgentScriptMode() {
+		runErr := runAgentScriptBootstrap(ctx, cfg, store)
+		if runErr != nil && !appIsListening(ctx, cfg) {
+			return runErr
+		}
+		if runErr != nil {
+			slog.Warn("bootstrap: agent_script errored but app port is open, treating as success",
+				"err", runErr.Error())
+			_, _ = store.AddFact(ctx, "agent_script",
+				"errored_but_port_open at "+time.Now().UTC().Format(time.RFC3339)+
 					": "+runErr.Error())
 		}
 		return finalizeBootstrapSuccess(ctx, cfg, marker)
