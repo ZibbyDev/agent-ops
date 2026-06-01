@@ -84,20 +84,28 @@ func newToken() (string, error) {
 //     LLM. Used for catalog (deterministic) installs where every line is
 //     known good — skips the ~$0.20 / 9-minute LLM-thinks-through-each-bash
 //     hop that v0.1.11 ran for these.
+//   - "cheatsheet" — LLM-driven install with catalog-provided hints
+//     (image + steps + known pitfalls). Reads AGENT_OPS_CHEATSHEET_JSON,
+//     assembles a system+user prompt, then routes through the same
+//     scheduler/claudecli path as agent-mode. Falls between script-mode
+//     (zero LLM, brittle) and goal-mode (full LLM, expensive). See
+//     cheatsheet.go for the prompt template + budget enforcement.
 //   - "agent" (default, or empty) — original path: hand cfg.Bootstrap.Prompt
 //     to the configured agent driver and let it use shell tools to think
 //     its way through. Still required for free-form `zibby_deploy_app
 //     --goal="..."` invocations and for non-catalog use of agent-ops.
 //
-// On either path the post-bootstrap port-register handshake + marker file
-// write are identical — both run through finalizeBootstrapSuccess.
+// On every path the post-bootstrap port-register handshake + marker file
+// write are identical — they all run through finalizeBootstrapSuccess.
 func MaybeRunFirstRun(
 	ctx context.Context,
 	cfg *config.Config,
 	sched *scheduler.Scheduler,
 	store *state.Store,
 ) error {
-	if cfg.Bootstrap == nil && strings.TrimSpace(os.Getenv("AGENT_OPS_BOOTSTRAP_SCRIPT")) == "" {
+	if cfg.Bootstrap == nil &&
+		strings.TrimSpace(os.Getenv("AGENT_OPS_BOOTSTRAP_SCRIPT")) == "" &&
+		!isCheatsheetMode() {
 		return nil
 	}
 	marker := filepath.Join(cfg.StateDir, "bootstrap.done")
@@ -147,6 +155,29 @@ func MaybeRunFirstRun(
 			_, _ = store.AddFact(ctx, "bootstrap",
 				"script_exit_nonzero_but_port_open at "+time.Now().UTC().Format(time.RFC3339)+
 					": "+scriptErr.Error())
+		}
+		return finalizeBootstrapSuccess(ctx, cfg, marker)
+	}
+
+	// Cheatsheet mode (0.3.4+) — LLM-driven install with catalog hints.
+	// Same final-state contract as script-mode: if the agent gets the app
+	// listening on AGENT_OPS_APP_PORT we treat it as success regardless of
+	// whether the model's own self-report claims success (LLMs lie about
+	// installs that crashed at the last second; the open TCP socket is
+	// the source of truth). On any agent failure we still check the port
+	// before declaring bootstrap failed, matching the script-mode
+	// "exit-nonzero-but-port-open" tolerance.
+	if isCheatsheetMode() {
+		_, runErr := runCheatsheetBootstrap(ctx, cfg, sched, store)
+		if runErr != nil && !appIsListening(ctx, cfg) {
+			return runErr
+		}
+		if runErr != nil {
+			slog.Warn("bootstrap: cheatsheet run errored but app port is open, treating as success",
+				"err", runErr.Error())
+			_, _ = store.AddFact(ctx, "cheatsheet",
+				"agent_errored_but_port_open at "+time.Now().UTC().Format(time.RFC3339)+
+					": "+runErr.Error())
 		}
 		return finalizeBootstrapSuccess(ctx, cfg, marker)
 	}
