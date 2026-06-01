@@ -27,7 +27,7 @@ import (
 )
 
 // version is set via -ldflags by the release pipeline.
-var version = "0.3.5"
+var version = "0.3.6"
 
 func main() {
 	// Subcommand routing: `agent-opsd version` short-circuits config load.

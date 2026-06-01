@@ -208,7 +208,7 @@ func renderConfigYAML(a initAnswers) string {
 	fmt.Fprintf(&b, "  model: %s\n", a.Model)
 	fmt.Fprintf(&b, "  api_key_env: %s\n", a.APIKeyEnv)
 	b.WriteString("  max_tool_calls_per_task: 25\n")
-	b.WriteString("  task_timeout: 20m\n\n")
+	b.WriteString("  task_timeout: 30m\n\n")
 	b.WriteString("mcp:\n")
 	b.WriteString("  listen_addr: \":7842\"\n")
 	b.WriteString("  token_env: AGENT_OPS_TOKEN\n\n")

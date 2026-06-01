@@ -370,7 +370,7 @@ func hasNonMCPListener(skipPort int) bool {
 // runScriptBootstrap is the LLM-less bootstrap path. It execs the verbatim
 // script from AGENT_OPS_BOOTSTRAP_SCRIPT via `bash -c` and streams stdout +
 // stderr to the daemon logger so CloudWatch captures every command. Honors
-// AGENT_OPS_BOOTSTRAP_TIMEOUT (default 20m) — exceeded → SIGKILL + error.
+// AGENT_OPS_BOOTSTRAP_TIMEOUT (default 30m) — exceeded → SIGKILL + error.
 //
 // Critical assumption: the script is responsible for daemonizing the
 // installed app (typically `nohup ... &` at the end). Once `bash -c`
@@ -461,9 +461,14 @@ func runScriptBootstrap(ctx context.Context, cfg *config.Config, store *state.St
 }
 
 // scriptBootstrapTimeout reads AGENT_OPS_BOOTSTRAP_TIMEOUT (e.g. "10m",
-// "1200s") with a 20m fallback. The previous LLM path enforced timeout via
+// "1200s") with a 30m fallback. The previous LLM path enforced timeout via
 // task.TaskTimeout; script mode reuses the same env hook so operators have
 // one knob.
+//
+// Bumped from 20m → 30m in 0.3.6 to match the new agent-mode bootstrap
+// default. Heavy installs (n8n's ~500MB npm install hits 25 min on slow
+// CDN days) blew through the old 20m baseline; bumping gives those
+// one-shot installs room to finish without operator override.
 func scriptBootstrapTimeout(cfg *config.Config) time.Duration {
 	if v := strings.TrimSpace(os.Getenv("AGENT_OPS_BOOTSTRAP_TIMEOUT")); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
@@ -475,7 +480,7 @@ func scriptBootstrapTimeout(cfg *config.Config) time.Duration {
 		// + npm install) — give them 2x the per-task budget.
 		return 2 * cfg.Agent.TaskTimeout
 	}
-	return 20 * time.Minute
+	return 30 * time.Minute
 }
 
 // streamPipe copies the child's stdout/stderr to slog line-by-line and

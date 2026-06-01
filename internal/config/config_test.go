@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 const validYAML = `
@@ -352,6 +353,123 @@ bootstrap:
 			}
 			if c.Bootstrap.Model != tc.wantModel {
 				t.Errorf("Bootstrap.Model = %q, want %q", c.Bootstrap.Model, tc.wantModel)
+			}
+		})
+	}
+}
+
+// TestParse_BootstrapMaxTurnsEnvOverride pins the per-deploy max-turns
+// override path: AGENT_OPS_BOOTSTRAP_MAX_TURNS, when a positive integer,
+// replaces cfg.Agent.MaxToolCallsPerTask before the daemon wires the
+// runner. Heavy goal-mode installs (n8n, OpenHands) need 60-100 turns
+// instead of the 25 default; the control plane sets this from CLI
+// --max-turns / MCP maxTurns / POST /apps body.maxTurns.
+//
+// Table-driven, same shape as BootstrapModelEnvOverride.
+func TestParse_BootstrapMaxTurnsEnvOverride(t *testing.T) {
+	cases := []struct {
+		name        string
+		envValue    string
+		wantMaxTurn int
+	}{
+		{
+			name:        "empty env: default 25 used (back-compat)",
+			envValue:    "",
+			wantMaxTurn: 25,
+		},
+		{
+			name:        "non-empty env: wins over default",
+			envValue:    "60",
+			wantMaxTurn: 60,
+		},
+		{
+			name:        "large valid value: honored up to int max",
+			envValue:    "200",
+			wantMaxTurn: 200,
+		},
+		{
+			name:        "non-integer: ignored, default survives",
+			envValue:    "not-a-number",
+			wantMaxTurn: 25,
+		},
+		{
+			name:        "zero: ignored (must be > 0)",
+			envValue:    "0",
+			wantMaxTurn: 25,
+		},
+		{
+			name:        "negative: ignored",
+			envValue:    "-5",
+			wantMaxTurn: 25,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("AGENT_OPS_BOOTSTRAP_MAX_TURNS", tc.envValue)
+			c, err := Parse(strings.NewReader(validYAML))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if c.Agent.MaxToolCallsPerTask != tc.wantMaxTurn {
+				t.Errorf("Agent.MaxToolCallsPerTask = %d, want %d",
+					c.Agent.MaxToolCallsPerTask, tc.wantMaxTurn)
+			}
+		})
+	}
+}
+
+// TestParse_BootstrapTimeoutMsEnvOverride pins the per-deploy wall-clock
+// override path: AGENT_OPS_BOOTSTRAP_TIMEOUT_MS, when a positive integer
+// of milliseconds, replaces cfg.Agent.TaskTimeout. Heavy installs that
+// npm-install ~500MB or compile native deps need 30-45min instead of
+// the new 15m default. Control plane converts minutes→ms on the wire.
+func TestParse_BootstrapTimeoutMsEnvOverride(t *testing.T) {
+	cases := []struct {
+		name        string
+		envValue    string
+		wantTimeout time.Duration
+	}{
+		{
+			name:        "empty env: default 15m used (back-compat)",
+			envValue:    "",
+			wantTimeout: 15 * time.Minute,
+		},
+		{
+			name:        "30 minutes in ms: wins over default",
+			envValue:    "1800000", // 30 * 60 * 1000
+			wantTimeout: 30 * time.Minute,
+		},
+		{
+			name:        "45 minutes in ms",
+			envValue:    "2700000", // 45 * 60 * 1000
+			wantTimeout: 45 * time.Minute,
+		},
+		{
+			name:        "non-integer: ignored, default survives",
+			envValue:    "30m", // a duration string, NOT ms — should be rejected
+			wantTimeout: 15 * time.Minute,
+		},
+		{
+			name:        "zero: ignored",
+			envValue:    "0",
+			wantTimeout: 15 * time.Minute,
+		},
+		{
+			name:        "negative: ignored",
+			envValue:    "-1000",
+			wantTimeout: 15 * time.Minute,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("AGENT_OPS_BOOTSTRAP_TIMEOUT_MS", tc.envValue)
+			c, err := Parse(strings.NewReader(validYAML))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if c.Agent.TaskTimeout != tc.wantTimeout {
+				t.Errorf("Agent.TaskTimeout = %s, want %s",
+					c.Agent.TaskTimeout, tc.wantTimeout)
 			}
 		})
 	}

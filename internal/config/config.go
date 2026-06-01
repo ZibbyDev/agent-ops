@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -202,7 +203,12 @@ func (c *Config) applyDefaults() {
 		c.Agent.MaxToolCallsPerTask = 25
 	}
 	if c.Agent.TaskTimeout == 0 {
-		c.Agent.TaskTimeout = 10 * time.Minute
+		// Bumped from 10m → 15m in 0.3.6: bootstrap (the dominant per-task
+		// cost on Managed Apps) routinely hits 10-12 minutes on slow npm
+		// CDN days; the scriptBootstrapTimeout 2x heuristic on top of this
+		// gives 30 min wall-clock for script-mode installs, matching the
+		// new agent-mode bootstrap default for goal-mode installs.
+		c.Agent.TaskTimeout = 15 * time.Minute
 	}
 	if c.MCP.ListenAddr == "" {
 		c.MCP.ListenAddr = ":7842"
@@ -257,6 +263,56 @@ func (c *Config) applyDefaults() {
 		c.Bootstrap.Model = m
 		slog.Info("bootstrap: model override from env",
 			"from_config", prev, "from_env", m)
+	}
+
+	// AGENT_OPS_BOOTSTRAP_MAX_TURNS env override. Per-deploy turn cap from
+	// the Zibby control plane (CLI --max-turns / MCP maxTurns / POST /apps
+	// body.maxTurns). Replaces cfg.Agent.MaxToolCallsPerTask so the
+	// runner (daemon.go:109) picks it up before the first task fires.
+	// Heavy goal-mode installs (n8n, OpenHands) exhaust the 25-default
+	// before finishing — bumping to 60-100 lets them complete. Logged
+	// at load so operators can grep CloudWatch for the swap.
+	//
+	// Parse failures: invalid integer / non-positive → ignored (keeps
+	// the baked default; logged at WARN so a misconfigured task def
+	// surfaces in logs but doesn't fail the daemon boot).
+	if v := strings.TrimSpace(os.Getenv("AGENT_OPS_BOOTSTRAP_MAX_TURNS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			prev := c.Agent.MaxToolCallsPerTask
+			c.Agent.MaxToolCallsPerTask = n
+			slog.Info("bootstrap: max_tool_calls_per_task override from env",
+				"from_config", prev, "from_env", n)
+		} else {
+			slog.Warn("bootstrap: AGENT_OPS_BOOTSTRAP_MAX_TURNS ignored — not a positive integer",
+				"raw", v)
+		}
+	}
+
+	// AGENT_OPS_BOOTSTRAP_TIMEOUT_MS env override. Per-deploy wall-clock
+	// cap (in milliseconds) from the Zibby control plane (CLI
+	// --timeout-min / MCP timeoutMin / POST /apps body.timeoutMin —
+	// minutes * 60 * 1000 on the wire). Replaces cfg.Agent.TaskTimeout
+	// so both the runner (agent-mode bootstrap) AND scriptBootstrapTimeout
+	// (script-mode bootstrap = 2x this on the heuristic fallback) pick
+	// up the new wall-clock budget.
+	//
+	// Heavy installs that npm-install ~500MB or compile native deps need
+	// 30-45 min instead of the 20-min baked default. Same parse-failure
+	// policy as MAX_TURNS above: invalid → ignored + WARN.
+	//
+	// Note: AGENT_OPS_BOOTSTRAP_TIMEOUT (Go duration string, e.g. "30m")
+	// is still honored by scriptBootstrapTimeout for direct operator
+	// override. The MS variant is what the Zibby control plane emits.
+	if v := strings.TrimSpace(os.Getenv("AGENT_OPS_BOOTSTRAP_TIMEOUT_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			prev := c.Agent.TaskTimeout
+			c.Agent.TaskTimeout = time.Duration(n) * time.Millisecond
+			slog.Info("bootstrap: task_timeout override from env",
+				"from_config", prev, "from_env_ms", n, "from_env", c.Agent.TaskTimeout)
+		} else {
+			slog.Warn("bootstrap: AGENT_OPS_BOOTSTRAP_TIMEOUT_MS ignored — not a positive integer",
+				"raw", v)
+		}
 	}
 
 	// AGENT_OPS_HEALTH_CHECK_PROMPT env override. Same pattern as the

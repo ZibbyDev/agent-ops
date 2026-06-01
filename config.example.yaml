@@ -25,11 +25,13 @@ agent:
   model: claude-haiku-4-5-20251001
   api_key_env: ANTHROPIC_API_KEY    # ignored when provider=claude-cli
   max_tool_calls_per_task: 25
-  # Bumped from 10m to 20m: bootstrap tasks like "install n8n" can hit
-  # 5-10 min on slow npm CDN days plus Claude API latency; the LLM also
-  # sometimes pauses mid-think waiting on Anthropic. Bumping gives those
-  # one-shot installs room to complete instead of getting SIGKILL'd.
-  task_timeout: 20m
+  # Bumped from 20m → 30m in 0.3.6: bootstrap tasks like "install n8n"
+  # routinely hit 20-25 min on slow npm CDN days plus Claude API latency;
+  # the LLM also pauses mid-think waiting on Anthropic. Bumping gives
+  # those one-shot installs room to complete instead of getting SIGKILL'd.
+  # Per-deploy override available via AGENT_OPS_BOOTSTRAP_TIMEOUT_MS (the
+  # Zibby control plane sets this from CLI --timeout-min / MCP timeoutMin).
+  task_timeout: 30m
 
 mcp:
   listen_addr: ":7842"
