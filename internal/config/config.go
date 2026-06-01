@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -234,6 +235,28 @@ func (c *Config) applyDefaults() {
 			}
 		}
 		c.Bootstrap.Prompt = p
+	}
+
+	// AGENT_OPS_BOOTSTRAP_MODEL env override. Per-deploy model pin from the
+	// Zibby control plane (CLI --model / MCP model field / POST /apps body
+	// .model). Replaces cfg.Bootstrap.Model so the same scheduler path
+	// that already honors per-task model overrides (scheduler.go's
+	// modelOverrides map, populated from cfg.Bootstrap.Model in
+	// Hydrate) picks up the new value. Synthesized Bootstrap when none
+	// exists, mirroring the BOOTSTRAP_PROMPT pattern above. Logged at
+	// load so operators can grep CloudWatch for the swap.
+	if m := strings.TrimSpace(os.Getenv("AGENT_OPS_BOOTSTRAP_MODEL")); m != "" {
+		if c.Bootstrap == nil {
+			c.Bootstrap = &Schedule{
+				Name:  "bootstrap",
+				Cron:  "@yearly",
+				Tools: []string{"shell"},
+			}
+		}
+		prev := c.Bootstrap.Model
+		c.Bootstrap.Model = m
+		slog.Info("bootstrap: model override from env",
+			"from_config", prev, "from_env", m)
 	}
 
 	// AGENT_OPS_HEALTH_CHECK_PROMPT env override. Same pattern as the

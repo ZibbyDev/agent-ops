@@ -272,6 +272,91 @@ schedules:
 	}
 }
 
+// TestParse_BootstrapModelEnvOverride pins the per-deploy model override
+// path: when AGENT_OPS_BOOTSTRAP_MODEL is non-empty, it wins over the
+// baked config.yaml `bootstrap.model:` value. The Zibby control plane
+// sets this on Fargate task definitions so a per-deploy `--model` flag
+// (CLI / MCP / POST /apps body field) can re-route the agent-ops
+// bootstrap to a different Claude model without re-baking config.
+//
+// Table-driven: empty env → config value survives; non-empty env wins;
+// env synthesizes a Bootstrap when config has none.
+func TestParse_BootstrapModelEnvOverride(t *testing.T) {
+	cases := []struct {
+		name      string
+		envValue  string
+		yaml      string
+		wantModel string
+		wantNil   bool // true → expect c.Bootstrap == nil
+	}{
+		{
+			name:     "empty env: config value used (back-compat)",
+			envValue: "",
+			yaml: validYAML + `
+bootstrap:
+  name: bootstrap
+  prompt: "install thing"
+  model: claude-haiku-4-5-20251001
+`,
+			wantModel: "claude-haiku-4-5-20251001",
+		},
+		{
+			name:     "non-empty env: wins over config",
+			envValue: "claude-opus-4-5",
+			yaml: validYAML + `
+bootstrap:
+  name: bootstrap
+  prompt: "install thing"
+  model: claude-haiku-4-5-20251001
+`,
+			wantModel: "claude-opus-4-5",
+		},
+		{
+			name:     "non-empty env, no config bootstrap: synthesizes one",
+			envValue: "claude-sonnet-4-6",
+			yaml:     validYAML, // no `bootstrap:` block at all
+			// PROMPT env is unset in this test, so without a prompt the
+			// synthesized Bootstrap would fail validation ("bootstrap.prompt is
+			// required"). We provide the prompt here so the synthesis path is
+			// reachable.
+			wantModel: "claude-sonnet-4-6",
+		},
+		{
+			name:     "empty env, no config bootstrap: stays nil",
+			envValue: "",
+			yaml:     validYAML,
+			wantNil:  true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("AGENT_OPS_BOOTSTRAP_MODEL", tc.envValue)
+			// The synthesis path also needs AGENT_OPS_BOOTSTRAP_PROMPT to
+			// satisfy validate()'s prompt-required check when config has no
+			// bootstrap block. Set it for that subcase.
+			if tc.envValue != "" && !strings.Contains(tc.yaml, "bootstrap:") {
+				t.Setenv("AGENT_OPS_BOOTSTRAP_PROMPT", "synthesized prompt for test")
+			}
+			c, err := Parse(strings.NewReader(tc.yaml))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if tc.wantNil {
+				if c.Bootstrap != nil {
+					t.Fatalf("Bootstrap = %+v, want nil", c.Bootstrap)
+				}
+				return
+			}
+			if c.Bootstrap == nil {
+				t.Fatal("Bootstrap is nil, want a value")
+			}
+			if c.Bootstrap.Model != tc.wantModel {
+				t.Errorf("Bootstrap.Model = %q, want %q", c.Bootstrap.Model, tc.wantModel)
+			}
+		})
+	}
+}
+
 func TestParse_AllowsReservedTopLevelKeys(t *testing.T) {
 	// Future v0.x features should not break v0.1 config files.
 	yaml := validYAML + `
