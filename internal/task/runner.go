@@ -18,6 +18,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -127,6 +129,35 @@ func composeSystemPrompt(base string, m state.Mission) string {
 	return b.String()
 }
 
+// houseRulesEnvVar is the env key the operator/control-plane sets to
+// PREPEND a free-form rules block to the system prompt. The intent is
+// to let the BACKEND (which builds the container env at task-def time)
+// iterate prompt language without forcing an agent-ops version bump +
+// ECR rebuild every time. Empty / whitespace-only → no change.
+//
+// Lives at runner-level because both bootstrap modes (goal + cheatsheet)
+// route through Runner.Run → composeSystemPrompt; injecting here is a
+// single chokepoint and the env is only populated by buildAgentOpsContainerEnv
+// for the bootstrap container, so no surprises for non-Apps deployments.
+const houseRulesEnvVar = "AGENT_OPS_BOOTSTRAP_SYSTEM_RULES"
+
+// applyBootstrapHouseRules prepends $AGENT_OPS_BOOTSTRAP_SYSTEM_RULES to
+// systemPrompt when the env var is set to a non-whitespace value. Logs a
+// one-line INFO record with the byte count so operators can confirm the
+// rules were honored from CloudWatch without re-spawning a container.
+func applyBootstrapHouseRules(systemPrompt string) string {
+	raw, _ := os.LookupEnv(houseRulesEnvVar)
+	rules := strings.TrimSpace(raw)
+	if rules == "" {
+		return systemPrompt
+	}
+	slog.Info("runner: prepending bootstrap house rules",
+		"env", houseRulesEnvVar,
+		"rules_bytes", len(rules),
+	)
+	return rules + "\n\n" + systemPrompt
+}
+
 // Trigger is the entry point — schedule | manual | bootstrap. Always returns
 // the run id (even on failure) so callers can subscribe to logs.
 type Trigger string
@@ -192,7 +223,7 @@ func (r *Runner) Run(ctx context.Context, spec Spec) (state.TaskRun, driver.Resu
 	if missionErr != nil {
 		_ = sink.Log(ctx, "warn", "could not read instance mission: "+missionErr.Error())
 	}
-	systemPrompt := composeSystemPrompt(r.SystemPrompt, mission)
+	systemPrompt := applyBootstrapHouseRules(composeSystemPrompt(r.SystemPrompt, mission))
 
 	dReq := driver.Request{
 		SystemPrompt: systemPrompt,

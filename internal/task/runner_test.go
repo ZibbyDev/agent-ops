@@ -3,6 +3,7 @@ package task
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -582,5 +583,77 @@ func TestRunner_ReporterReceivesFailedStatus(t *testing.T) {
 	}
 	if !strings.Contains(rec.Error, "boom") {
 		t.Fatalf("Error not surfaced in record: %q", rec.Error)
+	}
+}
+
+// TestApplyBootstrapHouseRules pins the env-driven prepend contract used
+// by the backend's buildAgentOpsContainerEnv splice. Three cases mirror
+// the splice modes: explicit rules present, env unset, env whitespace-only.
+//
+// Table-driven so future rule-shape evolutions (e.g. a JSON envelope
+// instead of free-form text) can be added without restructuring.
+func TestApplyBootstrapHouseRules(t *testing.T) {
+	const base = "BASE SYSTEM PROMPT"
+
+	cases := []struct {
+		name        string
+		envValue    string
+		envUnset    bool
+		wantPrefix  string // empty => expect output == base (no prepend)
+		wantUnchanged bool
+	}{
+		{
+			name:       "rules set → prepended with blank-line separator",
+			envValue:   "1. don't background installs",
+			wantPrefix: "1. don't background installs\n\n",
+		},
+		{
+			name:          "env unset → prompt unchanged",
+			envUnset:      true,
+			wantUnchanged: true,
+		},
+		{
+			name:          "env empty string → prompt unchanged",
+			envValue:      "",
+			wantUnchanged: true,
+		},
+		{
+			name:          "env whitespace-only → prompt unchanged",
+			envValue:      "  \n\t  \n",
+			wantUnchanged: true,
+		},
+		{
+			name:       "rules surrounded by whitespace → trimmed before prepend",
+			envValue:   "  \n  RULE A\n  ",
+			wantPrefix: "RULE A\n\n", // TrimSpace strips outer ws but inner survives
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if c.envUnset {
+				if err := os.Unsetenv(houseRulesEnvVar); err != nil {
+					t.Fatalf("Unsetenv: %v", err)
+				}
+			} else {
+				if err := os.Setenv(houseRulesEnvVar, c.envValue); err != nil {
+					t.Fatalf("Setenv: %v", err)
+				}
+				t.Cleanup(func() { _ = os.Unsetenv(houseRulesEnvVar) })
+			}
+			got := applyBootstrapHouseRules(base)
+			if c.wantUnchanged {
+				if got != base {
+					t.Fatalf("expected unchanged base, got %q", got)
+				}
+				return
+			}
+			if !strings.HasPrefix(got, c.wantPrefix) {
+				t.Fatalf("output missing expected prefix\nwant prefix: %q\ngot:         %q", c.wantPrefix, got)
+			}
+			if !strings.HasSuffix(got, base) {
+				t.Fatalf("output should end with base prompt; got %q", got)
+			}
+		})
 	}
 }
