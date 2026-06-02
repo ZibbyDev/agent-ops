@@ -60,6 +60,7 @@ type SoloSpec struct {
 	Source    SoloSource  `json:"source"`
 	Framework string      `json:"framework"`
 	Tier      string      `json:"tier"`
+	Region    string      `json:"region"` // AWS region for EC2/S3; control plane stays Sydney
 	Secrets   []SoloSec   `json:"secrets"`
 	Domain    string      `json:"domain"`
 	Persist   SoloPersist `json:"persistence"`
@@ -937,6 +938,7 @@ func (r *SoloRunner) writeLitestreamConfig() error {
 	if bucket == "" {
 		return errors.New("litestream: bucket name resolved empty (need accountId + slug)")
 	}
+	region := r.litestreamRegion()
 	// Rails default: <appdir>/storage/production.sqlite3. Fall back to
 	// db/production.sqlite3 (older Rails layouts). agent-ops watches
 	// both paths via two `dbs:` entries.
@@ -948,18 +950,29 @@ dbs:
       - type: s3
         bucket: %s
         path: rails-storage
-        region: ap-southeast-2
+        region: %s
   - path: %s/db/production.sqlite3
     replicas:
       - type: s3
         bucket: %s
         path: rails-db
-        region: ap-southeast-2
+        region: %s
 `,
-		r.Env["ZIBBY_APP_DIR"], bucket,
-		r.Env["ZIBBY_APP_DIR"], bucket,
+		r.Env["ZIBBY_APP_DIR"], bucket, region,
+		r.Env["ZIBBY_APP_DIR"], bucket, region,
 	)
 	return os.WriteFile(r.Paths.LitestreamCfg, []byte(cfg), 0o644)
+}
+
+// litestreamRegion returns the AWS region the S3 replica bucket lives in.
+// The backend provisions the bucket in spec.region (multi-region solo);
+// Litestream needs the matching region or its S3 client signs requests
+// against the wrong endpoint. Defaults to Sydney for legacy/empty specs.
+func (r *SoloRunner) litestreamRegion() string {
+	if r.spec != nil && strings.TrimSpace(r.spec.Region) != "" {
+		return strings.TrimSpace(r.spec.Region)
+	}
+	return "ap-southeast-2"
 }
 
 // writeMicroPumaConfig drops <app>/config/puma_zibby.rb — a single
