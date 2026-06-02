@@ -58,6 +58,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -779,6 +780,26 @@ func superviseScript(ctx context.Context, in superviseConfig) (res superviseResu
 		prevLiveBytes = liveBytes
 		idle := time.Since(lastGrow)
 
+		// Short-circuit: process exited 0 AND verify port already serving
+		// is a definitive success — don't burn supervisor turns asking
+		// Claude to confirm what we can verify ourselves. The n8n smoke
+		// (2026-06-01) showed the supervisor false-positive-intervening
+		// while looping waiting for "startup logs" that never reach
+		// stdout (apps log to their own files post-`nohup ... &`). The
+		// loopback HTTP probe is ground truth: if the port responds, the
+		// app is up, regardless of what stdout says.
+		if procStatus == "EXITED" && exitPtr != nil && *exitPtr == 0 && in.VerifyPortHint > 0 {
+			if cc := probeLocalPort(ctx, in.VerifyPortHint); cc >= 200 && cc < 500 {
+				slog.Info("agent_script: auto-done (exit 0 + verify port serving)",
+					"iter", iter, "turn", turn,
+					"verify_port", in.VerifyPortHint, "curl_code", cc,
+				)
+				res.FinalVerdict = "done"
+				res.FinalNote = fmt.Sprintf("script exited 0; port %d returned http %d (agent-ops short-circuit, supervisor not consulted)", in.VerifyPortHint, cc)
+				return res, nil
+			}
+		}
+
 		// Invoke supervisor.
 		out, err := in.Supervisor.Check(ctx, SupervisorInput{
 			Goal:           in.Goal,
@@ -881,6 +902,31 @@ func superviseScript(ctx context.Context, in superviseConfig) (res superviseResu
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────
+
+// probeLocalPort issues GET http://127.0.0.1:<port>/ with a 5-second
+// timeout and returns the HTTP status code. Network / timeout errors
+// return 0. Used by the supervise loop's short-circuit path: when the
+// script exits 0 and this port responds 2xx-499, agent-ops declares
+// success without burning more supervisor turns.
+//
+// Single-shot — no retry loop. The caller polls this every
+// supervise-tick if needed, so a per-call retry inside would compound.
+func probeLocalPort(ctx context.Context, port int) int {
+	url := fmt.Sprintf("http://127.0.0.1:%d/", port)
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, "GET", url, nil)
+	if err != nil {
+		return 0
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode
+}
 
 // tailBytesFrom returns the last n bytes of buf.String(), preferring to
 // cut on a newline boundary so the supervisor doesn't see a partial line
