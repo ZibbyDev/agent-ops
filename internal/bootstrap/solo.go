@@ -574,7 +574,12 @@ func (r *SoloRunner) stepInstallAppDeps(ctx context.Context) error {
 		if _, _, err := r.Cmd.Run(ctx, "bash", "-c", fmt.Sprintf("cd %s && gem install bundler --no-document", shellEscape(versioned))); err != nil {
 			return fmt.Errorf("gem install bundler: %w", err)
 		}
-		if _, _, err := r.Cmd.Run(ctx, "bash", "-c", fmt.Sprintf("cd %s && bundle config set --local path vendor/bundle && bundle install --jobs=4 --retry=3", shellEscape(versioned))); err != nil {
+		// --jobs=1 (sequential): native gem compiles (sqlite3, nokogiri,
+		// yajl) each peak at ~150-200MB; running 4 in parallel reliably
+		// OOM-kills a 512MB t4g.nano. Cost is ~30s slower install on
+		// the small tier (1GB) where parallelism could have helped, but
+		// the safety-net is universal across all four tier sizes.
+		if _, _, err := r.Cmd.Run(ctx, "bash", "-c", fmt.Sprintf("cd %s && bundle config set --local path vendor/bundle && bundle install --jobs=1 --retry=3", shellEscape(versioned))); err != nil {
 			return fmt.Errorf("bundle install: %w", err)
 		}
 		// Storage + tmp dirs — Rails creates these on first boot but
