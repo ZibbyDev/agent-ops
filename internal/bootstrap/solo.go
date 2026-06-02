@@ -68,7 +68,7 @@ type SoloSpec struct {
 // SoloSource is the source-of-truth for what we install. Exactly one of
 // the inner discriminators is populated based on Type.
 type SoloSource struct {
-	Type  string `json:"type"`  // "github" | "tarball"
+	Type  string `json:"type"` // "github" | "tarball"
 	Repo  string `json:"repo,omitempty"`
 	Ref   string `json:"ref,omitempty"`
 	S3URL string `json:"s3Url,omitempty"`
@@ -145,9 +145,9 @@ func DefaultSoloPaths() SoloPaths {
 type SoloRunner struct {
 	Paths      SoloPaths
 	Logger     *slog.Logger
-	Cmd        commandRunner  // exec.CommandContext wrapper; tests stub
-	Phase      phaseReporter  // POSTs to status URL
-	HTTPClient *http.Client   // for healthcheck + phase
+	Cmd        commandRunner // exec.CommandContext wrapper; tests stub
+	Phase      phaseReporter // POSTs to status URL
+	HTTPClient *http.Client  // for healthcheck + phase
 	Env        map[string]string
 
 	// Loaded from disk in Load().
@@ -378,6 +378,12 @@ func (r *SoloRunner) Run(ctx context.Context) error {
 	if err := r.withTimeout(ctx, 15*time.Minute, r.stepInstallOSDeps); err != nil {
 		return fmt.Errorf("install-os: %w", err)
 	}
+	// Micro-tier (t4g.nano, 0.5GB) memory hardening — jemalloc + 2GB
+	// swap. Runs AFTER OS deps (so apt is warm) but BEFORE the heavy
+	// bundle/npm install that would otherwise OOM. No-op on larger tiers.
+	if err := r.withTimeout(ctx, 5*time.Minute, r.stepMemoryTuning); err != nil {
+		return fmt.Errorf("memory-tuning: %w", err)
+	}
 	// Persistence (Litestream restore + daemon) runs BEFORE app deps
 	// so a redeploy / reprovision sees the restored DB before
 	// db:migrate runs. db:migrate is idempotent — it skips if the
@@ -411,6 +417,54 @@ func (r *SoloRunner) withTimeout(parent context.Context, d time.Duration, fn fun
 	ctx, cancel := context.WithTimeout(parent, d)
 	defer cancel()
 	return fn(ctx)
+}
+
+// jemallocPath is the libjemalloc.so.2 location on Debian 12 ARM64.
+// Hoisted so tests + the systemd unit writer share one source of truth.
+const jemallocPath = "/usr/lib/aarch64-linux-gnu/libjemalloc.so.2"
+
+// swapFilePath is where stepMemoryTuning allocates swap. /var (not /tmp)
+// so it survives across the install and lives on the EBS root volume.
+const swapFilePath = "/var/swapfile"
+
+// isMicro reports whether the running tier is memory-constrained enough
+// to need the OOM-avoidance treatment (jemalloc, swap, single-worker
+// Puma, bootsnap). True when the spec tier is "micro" OR the host has
+// <1GB total RAM (auto-detected from /proc/meminfo — covers the case
+// where a tier label is missing but the box is still tiny).
+//
+// We deliberately DON'T apply this to small/medium/large: the swap
+// allocation + single-worker Puma would needlessly slow them down.
+func (r *SoloRunner) isMicro() bool {
+	if r.spec != nil && strings.EqualFold(strings.TrimSpace(r.spec.Tier), "micro") {
+		return true
+	}
+	return hostTotalRAMBytes() > 0 && hostTotalRAMBytes() < (1<<30) // <1GiB
+}
+
+// hostTotalRAMBytes reads MemTotal from /proc/meminfo (kB) and returns
+// it in bytes. Returns 0 if /proc/meminfo can't be read (e.g. macOS test
+// host) — callers treat 0 as "unknown, don't auto-trigger".
+var hostTotalRAMBytes = func() int64 {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0
+		}
+		kb, perr := strconv.ParseInt(fields[1], 10, 64)
+		if perr != nil {
+			return 0
+		}
+		return kb * 1024
+	}
+	return 0
 }
 
 // ─── Steps ────────────────────────────────────────────────────────────────
@@ -534,6 +588,62 @@ func (r *SoloRunner) stepInstallOSDeps(ctx context.Context) error {
 	return nil
 }
 
+// stepMemoryTuning applies the t4g.nano OOM-avoidance treatment: install
+// jemalloc (lower fragmentation than glibc malloc on Ruby workloads) and
+// allocate a 2GB swapfile on the EBS root so the native-gem compiles +
+// the first Rails boot don't get OOM-killed on a 512MB box. Idempotent
+// and a complete no-op on larger tiers.
+//
+// The swap is real EBS-backed swap (slow, but the alternative is the
+// oom-killer). It's allocated once; re-runs detect /var/swapfile and
+// skip. jemalloc is wired into the systemd unit's LD_PRELOAD in
+// stepWriteSystemdUnit (not here) so the running app — not just the
+// install — benefits.
+func (r *SoloRunner) stepMemoryTuning(ctx context.Context) error {
+	if !r.isMicro() {
+		return nil
+	}
+	r.Phase.Push(ctx, PhaseInstalling, "memory-tuning")
+
+	// jemalloc — best-effort. apt-get update was already run by
+	// stepInstallOSDeps for rails; run it again defensively (cheap no-op
+	// if the index is fresh).
+	_, _, _ = r.Cmd.Run(ctx, "apt-get", "update", "-y")
+	if _, _, err := r.Cmd.Run(ctx, "apt-get", "install", "-y", "--no-install-recommends", "libjemalloc2"); err != nil {
+		// Non-fatal: the app still runs without jemalloc, just with more
+		// memory fragmentation. Log + continue.
+		if r.Logger != nil {
+			r.Logger.Warn("solo: libjemalloc2 install failed (continuing without jemalloc)", "err", err.Error())
+		}
+	}
+
+	// Swap — idempotent. Skip the whole block if /var/swapfile already
+	// exists (a re-bootstrap or in-place restart).
+	if _, err := os.Stat(swapFilePath); err == nil {
+		if r.Logger != nil {
+			r.Logger.Info("solo: swapfile already present, skipping allocation", "path", swapFilePath)
+		}
+		return nil
+	}
+	// fallocate → chmod 600 → mkswap → swapon, then persist in fstab.
+	// One bash -c so a failure short-circuits the rest of the chain.
+	swapScript := fmt.Sprintf(
+		"fallocate -l 2G %[1]s && chmod 600 %[1]s && mkswap %[1]s && swapon %[1]s && "+
+			"grep -q '%[1]s' /etc/fstab || echo '%[1]s none swap sw 0 0' >> /etc/fstab",
+		swapFilePath,
+	)
+	if _, _, err := r.Cmd.Run(ctx, "bash", "-c", swapScript); err != nil {
+		// Non-fatal: some environments (e.g. nested virt, restricted
+		// kernels) refuse swapon. Without swap the install may still
+		// squeak by thanks to jemalloc + --jobs=1; if it OOMs, the
+		// healthcheck will fail loudly and the operator sees it.
+		if r.Logger != nil {
+			r.Logger.Warn("solo: swap allocation failed (continuing without swap)", "err", err.Error())
+		}
+	}
+	return nil
+}
+
 // osPackagesFor returns the apt packages a framework needs beyond the
 // always-installed baseline. Kept conservative — when the user picks a
 // non-default Ruby version, etc., they own the version mgmt.
@@ -585,8 +695,36 @@ func (r *SoloRunner) stepInstallAppDeps(ctx context.Context) error {
 		// OOM-kills a 512MB t4g.nano. Cost is ~30s slower install on
 		// the small tier (1GB) where parallelism could have helped, but
 		// the safety-net is universal across all four tier sizes.
-		if _, _, err := r.Cmd.Run(ctx, "bash", "-c", fmt.Sprintf("cd %s && bundle config set --local path vendor/bundle && bundle install --jobs=1 --retry=3", shellEscape(versioned))); err != nil {
+		//
+		// `bundle config set --local without 'development test'` drops the
+		// dev/test gem groups (rspec, debug, web-console, etc.) — fewer
+		// gems to compile = less peak RSS AND a smaller vendor/bundle.
+		// Applied to ALL tiers: a production solo deploy never needs the
+		// dev/test groups.
+		if _, _, err := r.Cmd.Run(ctx, "bash", "-c", fmt.Sprintf(
+			"cd %s && bundle config set --local path vendor/bundle && bundle config set --local without 'development test' && bundle install --jobs=1 --retry=3",
+			shellEscape(versioned))); err != nil {
 			return fmt.Errorf("bundle install: %w", err)
+		}
+		// Bootsnap precompile (best-effort, micro only) — precompiling the
+		// YAML/ISeq caches up-front means the first Rails boot doesn't pay
+		// the (memory-heavy) compile cost while also trying to bind the
+		// port + answer the healthcheck. Suppress all output + never fail
+		// the install on it: many apps don't bundle bootsnap, in which
+		// case the command is a no-op error we swallow.
+		if r.isMicro() {
+			_, _, _ = r.Cmd.Run(ctx, "bash", "-c", fmt.Sprintf(
+				"cd %s && RAILS_ENV=production bundle exec bootsnap precompile --gemfile app/ lib/ 2>/dev/null || true",
+				shellEscape(versioned)))
+			// Write the memory-frugal Puma config (single worker, single
+			// thread) so the systemd unit's ExecStart can prefer it.
+			if err := r.writeMicroPumaConfig(versioned); err != nil {
+				// Non-fatal: without it we fall back to `rails server`,
+				// which is heavier but still boots. Log + continue.
+				if r.Logger != nil {
+					r.Logger.Warn("solo: write puma_zibby.rb failed (continuing)", "err", err.Error())
+				}
+			}
 		}
 		// Storage + tmp dirs — Rails creates these on first boot but
 		// it's safer to pre-create so SQLite path resolution works on
@@ -735,11 +873,11 @@ func (r *SoloRunner) maybeRestoreFromLitestream(ctx context.Context) error {
 	}
 
 	candidates := []struct {
-		localPath  string
-		s3Replica  string
+		localPath string
+		s3Replica string
 	}{
 		{filepath.Join(appDir, "storage/production.sqlite3"), fmt.Sprintf("s3://%s/rails-storage", bucket)},
-		{filepath.Join(appDir, "db/production.sqlite3"),      fmt.Sprintf("s3://%s/rails-db", bucket)},
+		{filepath.Join(appDir, "db/production.sqlite3"), fmt.Sprintf("s3://%s/rails-db", bucket)},
 	}
 
 	var lastErr error
@@ -822,6 +960,28 @@ dbs:
 		r.Env["ZIBBY_APP_DIR"], bucket,
 	)
 	return os.WriteFile(r.Paths.LitestreamCfg, []byte(cfg), 0o644)
+}
+
+// writeMicroPumaConfig drops <app>/config/puma_zibby.rb — a single
+// worker, single thread, no-preload Puma config tuned for the 512MB
+// t4g.nano. preload_app! is OFF (preloading forks COW but the master +
+// worker each carry the full app image; on 0.5GB the savings don't
+// outweigh the spike). The systemd ExecStart (micro) points puma at this
+// file via `-C config/puma_zibby.rb`.
+func (r *SoloRunner) writeMicroPumaConfig(appDir string) error {
+	cfg := `# zibby-managed; do not edit by hand. (micro tier — 0.5GB RAM)
+workers Integer(ENV.fetch("WEB_CONCURRENCY", 1))
+threads_count = Integer(ENV.fetch("RAILS_MAX_THREADS", 1))
+threads threads_count, threads_count
+preload_app! false
+bind "tcp://0.0.0.0:3000"
+environment "production"
+`
+	dst := filepath.Join(appDir, "config", "puma_zibby.rb")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("mkdir config: %w", err)
+	}
+	return os.WriteFile(dst, []byte(cfg), 0o644)
 }
 
 func (r *SoloRunner) dbBucketName() string {
@@ -929,7 +1089,8 @@ func (r *SoloRunner) stepWriteSystemdUnit(ctx context.Context) error {
 	}
 
 	port := r.frameworkPort()
-	exec := frameworkExecStart(fw, port)
+	micro := r.isMicro()
+	exec := frameworkExecStart(fw, port, micro)
 	extraEnv := ""
 	for k, v := range r.Env {
 		if k == "ZIBBY_APP_DIR" || k == "ZIBBY_FRAMEWORK" {
@@ -954,6 +1115,20 @@ func (r *SoloRunner) stepWriteSystemdUnit(ctx context.Context) error {
 		extraEnv += "Environment=RAILS_ENV=production\n"
 		extraEnv += "Environment=RAILS_LOG_TO_STDOUT=true\n"
 		extraEnv += "Environment=RAILS_SERVE_STATIC_FILES=true\n"
+		// Micro tier: pin the process to jemalloc + a frugal GC + a
+		// single Puma worker/thread so the 0.5GB box doesn't OOM under
+		// load. Only set LD_PRELOAD if jemalloc is actually present —
+		// a missing .so would make systemd ld.so warn on every spawn.
+		if micro {
+			if _, err := os.Stat(jemallocPath); err == nil {
+				extraEnv += fmt.Sprintf("Environment=LD_PRELOAD=%s\n", jemallocPath)
+			}
+			extraEnv += "Environment=MALLOC_ARENA_MAX=2\n"
+			extraEnv += "Environment=RUBY_GC_HEAP_INIT_SLOTS=1000000\n"
+			extraEnv += "Environment=RUBY_GC_HEAP_FREE_SLOTS=500000\n"
+			extraEnv += "Environment=WEB_CONCURRENCY=1\n"
+			extraEnv += "Environment=RAILS_MAX_THREADS=1\n"
+		}
 	}
 
 	unit := fmt.Sprintf(`# zibby-managed; do not edit by hand.
@@ -987,14 +1162,18 @@ WantedBy=multi-user.target
 	return nil
 }
 
-func frameworkExecStart(framework string, port int) string {
+func frameworkExecStart(framework string, port int, micro bool) string {
 	switch framework {
 	case "rails":
-		// Rails 7 production. We prefer `puma -C config/puma.rb` when
-		// the app ships its own puma config (the common production
-		// shape); fall back to `rails server` otherwise. Both bind to
-		// 0.0.0.0:$PORT — Caddy on the same host reverse-proxies from
-		// 80/443 via 127.0.0.1:$PORT.
+		// Rails 7 production. On micro we ALWAYS prefer the zibby-written
+		// config/puma_zibby.rb (single worker/thread, no preload) — it's
+		// the only thing that reliably fits 0.5GB. On larger tiers we
+		// prefer the app's own config/puma.rb when present, else fall
+		// back to `rails server`. Both bind 0.0.0.0:$PORT — Caddy on the
+		// same host reverse-proxies from 80/443 via 127.0.0.1:$PORT.
+		if micro {
+			return fmt.Sprintf("/bin/bash -lc 'cd /opt/app/current && if [ -f config/puma_zibby.rb ]; then bundle exec puma -C config/puma_zibby.rb; else bundle exec rails server -b 0.0.0.0 -p %d -e production; fi'", port)
+		}
 		return fmt.Sprintf("/bin/bash -lc 'cd /opt/app/current && if [ -f config/puma.rb ]; then bundle exec puma -C config/puma.rb; else bundle exec rails server -b 0.0.0.0 -p %d -e production; fi'", port)
 	case "node":
 		// Convention: package.json's `start` script binds to PORT.

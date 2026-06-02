@@ -22,8 +22,14 @@ type fakeCmd struct {
 	canned map[string]fakeRet
 }
 
-type fakeCall struct{ name string; args []string }
-type fakeRet struct{ stdout, stderr string; err error }
+type fakeCall struct {
+	name string
+	args []string
+}
+type fakeRet struct {
+	stdout, stderr string
+	err            error
+}
 
 func newFakeCmd() *fakeCmd { return &fakeCmd{canned: map[string]fakeRet{}} }
 
@@ -53,7 +59,10 @@ type fakePhase struct {
 	mu  sync.Mutex
 	got []phaseEvent
 }
-type phaseEvent struct{ Phase SoloPhase; Detail string }
+type phaseEvent struct {
+	Phase  SoloPhase
+	Detail string
+}
 
 func (f *fakePhase) Push(_ context.Context, p SoloPhase, d string) {
 	f.mu.Lock()
@@ -208,11 +217,11 @@ func TestRunSoloFromSpecRespectsFailedMarker(t *testing.T) {
 }
 
 func TestFrameworkExecStartContainsPort(t *testing.T) {
-	got := frameworkExecStart("rails", 3000)
+	got := frameworkExecStart("rails", 3000, false)
 	if !strings.Contains(got, "-p 3000") {
 		t.Errorf("rails ExecStart missing port: %s", got)
 	}
-	got = frameworkExecStart("python", 8000)
+	got = frameworkExecStart("python", 8000, false)
 	if !strings.Contains(got, "8000") {
 		t.Errorf("python ExecStart missing port: %s", got)
 	}
@@ -223,13 +232,114 @@ func TestRailsExecStartPrefersPumaConfig(t *testing.T) {
 	// paths bind to PORT so the existing test still passes (it greps
 	// for `-p 3000`), but we also need to confirm the puma branch
 	// exists for apps that ship their own config.
-	got := frameworkExecStart("rails", 3000)
+	got := frameworkExecStart("rails", 3000, false)
 	if !strings.Contains(got, "puma -C config/puma.rb") {
 		t.Errorf("rails ExecStart missing puma -C config/puma.rb branch: %s", got)
 	}
 	// Fallback branch still present for the no-config case.
 	if !strings.Contains(got, "rails server") {
 		t.Errorf("rails ExecStart missing fallback `rails server`: %s", got)
+	}
+}
+
+func TestRailsExecStartMicroPrefersZibbyPumaConfig(t *testing.T) {
+	// On micro we point puma at the zibby-written single-worker config
+	// rather than the app's own puma.rb (which may spin up multiple
+	// workers + OOM the nano).
+	got := frameworkExecStart("rails", 3000, true)
+	if !strings.Contains(got, "config/puma_zibby.rb") {
+		t.Errorf("micro rails ExecStart missing config/puma_zibby.rb branch: %s", got)
+	}
+	if strings.Contains(got, "config/puma.rb") {
+		t.Errorf("micro rails ExecStart should NOT reference app's config/puma.rb: %s", got)
+	}
+}
+
+func TestIsMicro(t *testing.T) {
+	cases := []struct {
+		tier string
+		want bool
+	}{
+		{"micro", true},
+		{"MICRO", true},
+		{" micro ", true},
+		{"small", false},
+		{"large", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		r := &SoloRunner{spec: &SoloSpec{Tier: c.tier}}
+		if got := r.isMicro(); got != c.want {
+			t.Errorf("isMicro(tier=%q) = %v, want %v", c.tier, got, c.want)
+		}
+	}
+}
+
+func TestWriteMicroPumaConfig(t *testing.T) {
+	dir := t.TempDir()
+	r := &SoloRunner{}
+	if err := r.writeMicroPumaConfig(dir); err != nil {
+		t.Fatalf("writeMicroPumaConfig: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "config", "puma_zibby.rb"))
+	if err != nil {
+		t.Fatalf("read puma_zibby.rb: %v", err)
+	}
+	body := string(b)
+	for _, want := range []string{
+		`workers Integer(ENV.fetch("WEB_CONCURRENCY", 1))`,
+		`preload_app! false`,
+		`bind "tcp://0.0.0.0:3000"`,
+		`environment "production"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("puma_zibby.rb missing %q\n--- got ---\n%s", want, body)
+		}
+	}
+}
+
+func TestStepMemoryTuningSkipsNonMicro(t *testing.T) {
+	stub := newFakeCmd()
+	r := &SoloRunner{
+		spec: &SoloSpec{Tier: "small"},
+		Cmd:  stub,
+		Env:  map[string]string{},
+	}
+	r.Phase = &fakePhase{}
+	if err := r.stepMemoryTuning(context.Background()); err != nil {
+		t.Fatalf("stepMemoryTuning(small): %v", err)
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected no commands on small tier, got %+v", stub.calls)
+	}
+}
+
+func TestStepMemoryTuningMicroInstallsJemallocAndSwap(t *testing.T) {
+	stub := newFakeCmd()
+	r := &SoloRunner{
+		spec: &SoloSpec{Tier: "micro"},
+		Cmd:  stub,
+		Env:  map[string]string{},
+	}
+	r.Phase = &fakePhase{}
+	if err := r.stepMemoryTuning(context.Background()); err != nil {
+		t.Fatalf("stepMemoryTuning(micro): %v", err)
+	}
+	var sawJemalloc, sawSwap bool
+	for _, c := range stub.calls {
+		joined := c.name + " " + strings.Join(c.args, " ")
+		if strings.Contains(joined, "libjemalloc2") {
+			sawJemalloc = true
+		}
+		if strings.Contains(joined, "swapfile") && strings.Contains(joined, "mkswap") {
+			sawSwap = true
+		}
+	}
+	if !sawJemalloc {
+		t.Errorf("expected libjemalloc2 install, calls=%+v", stub.calls)
+	}
+	if !sawSwap {
+		t.Errorf("expected swapfile allocation (mkswap), calls=%+v", stub.calls)
 	}
 }
 
