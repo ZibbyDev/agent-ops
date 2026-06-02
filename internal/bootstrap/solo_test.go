@@ -218,6 +218,118 @@ func TestFrameworkExecStartContainsPort(t *testing.T) {
 	}
 }
 
+func TestRailsExecStartPrefersPumaConfig(t *testing.T) {
+	// New ExecStart shape: branches on `[ -f config/puma.rb ]`. Both
+	// paths bind to PORT so the existing test still passes (it greps
+	// for `-p 3000`), but we also need to confirm the puma branch
+	// exists for apps that ship their own config.
+	got := frameworkExecStart("rails", 3000)
+	if !strings.Contains(got, "puma -C config/puma.rb") {
+		t.Errorf("rails ExecStart missing puma -C config/puma.rb branch: %s", got)
+	}
+	// Fallback branch still present for the no-config case.
+	if !strings.Contains(got, "rails server") {
+		t.Errorf("rails ExecStart missing fallback `rails server`: %s", got)
+	}
+}
+
+func TestPersistOrGenerateSecretIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret")
+	r := &SoloRunner{}
+	got1 := r.persistOrGenerateSecret(path)
+	if len(got1) != 128 {
+		t.Errorf("expected 128 hex chars, got %d", len(got1))
+	}
+	got2 := r.persistOrGenerateSecret(path)
+	if got1 != got2 {
+		t.Error("persistOrGenerateSecret should return the same value on second call")
+	}
+	// File mode should be 0600 (secret).
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("expected 0600, got %o", info.Mode().Perm())
+	}
+}
+
+func TestMaybeRestoreFromLitestreamSkipsWhenLocalDBExists(t *testing.T) {
+	// If the SQLite file already exists with content, skip the restore.
+	dir := t.TempDir()
+	appDir := filepath.Join(dir, "v1")
+	mustMkdir(t, filepath.Join(appDir, "storage"))
+	mustMkdir(t, filepath.Join(appDir, "db"))
+	// Write a non-empty file at both candidate paths.
+	writeFile(t, filepath.Join(appDir, "storage/production.sqlite3"), "SQLite-magic")
+	writeFile(t, filepath.Join(appDir, "db/production.sqlite3"), "SQLite-magic")
+
+	stub := newFakeCmd()
+	r := &SoloRunner{
+		Cmd: stub,
+		Env: map[string]string{"ZIBBY_APP_DIR": appDir},
+		spec: &SoloSpec{
+			AppSlug: "rails-blog",
+			Persist: SoloPersist{DB: "sqlite-litestream"},
+		},
+		accountID: "455456047181",
+	}
+	err := r.maybeRestoreFromLitestream(context.Background())
+	if err != nil {
+		t.Fatalf("expected nil err when DB already exists, got %v", err)
+	}
+	// No restore command should have run.
+	for _, c := range stub.calls {
+		if c.name == "litestream" {
+			t.Errorf("expected NO litestream call when local DB exists, got: %+v", c)
+		}
+	}
+}
+
+func TestMaybeRestoreFromLitestreamCallsLitestreamWhenDBMissing(t *testing.T) {
+	dir := t.TempDir()
+	appDir := filepath.Join(dir, "v1")
+	mustMkdir(t, appDir)
+	// No storage/production.sqlite3 file yet — restore SHOULD attempt.
+
+	stub := newFakeCmd()
+	r := &SoloRunner{
+		Cmd: stub,
+		Env: map[string]string{"ZIBBY_APP_DIR": appDir},
+		spec: &SoloSpec{
+			AppSlug: "rails-blog",
+			Persist: SoloPersist{DB: "sqlite-litestream"},
+		},
+		accountID: "455456047181",
+	}
+	// stub returns OK for the litestream restore so the first candidate
+	// "succeeds" and we return early.
+	_ = r.maybeRestoreFromLitestream(context.Background())
+	// First call should be the litestream restore.
+	if len(stub.calls) == 0 {
+		t.Fatal("expected at least one Cmd.Run call")
+	}
+	if stub.calls[0].name != "litestream" || stub.calls[0].args[0] != "restore" {
+		t.Errorf("first call expected `litestream restore`, got %+v", stub.calls[0])
+	}
+	// Targeted at the storage/ layout first (Rails 7+ default).
+	hasStoragePath := false
+	for _, c := range stub.calls {
+		if c.name != "litestream" {
+			continue
+		}
+		for _, a := range c.args {
+			if strings.Contains(a, "storage/production.sqlite3") {
+				hasStoragePath = true
+			}
+		}
+	}
+	if !hasStoragePath {
+		t.Errorf("expected litestream call to target storage/production.sqlite3, calls=%+v", stub.calls)
+	}
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 func mustTouch(t *testing.T, path string) {

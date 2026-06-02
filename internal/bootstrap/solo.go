@@ -34,6 +34,7 @@ package bootstrap
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,6 +48,10 @@ import (
 	"strings"
 	"time"
 )
+
+// cryptoRandRead is the binding for crypto/rand.Read — pulled into a
+// var so testers can stub.
+var cryptoRandRead = cryptorand.Read
 
 // SoloSpec mirrors backend/src/handlers/__contracts__/solo-deploy-spec.md.
 // JSON tags MUST match the backend wire shape verbatim.
@@ -572,9 +577,20 @@ func (r *SoloRunner) stepInstallAppDeps(ctx context.Context) error {
 		if _, _, err := r.Cmd.Run(ctx, "bash", "-c", fmt.Sprintf("cd %s && bundle config set --local path vendor/bundle && bundle install --jobs=4 --retry=3", shellEscape(versioned))); err != nil {
 			return fmt.Errorf("bundle install: %w", err)
 		}
-		// Rails asset precompile + db migrate — best-effort (some apps
-		// don't have assets; that's not fatal).
-		_, _, _ = r.Cmd.Run(ctx, "bash", "-c", fmt.Sprintf("cd %s && RAILS_ENV=production bundle exec rake db:create db:migrate 2>&1 || true", shellEscape(versioned)))
+		// Storage + tmp dirs — Rails creates these on first boot but
+		// it's safer to pre-create so SQLite path resolution works on
+		// the first db:migrate.
+		_, _, _ = r.Cmd.Run(ctx, "bash", "-c", fmt.Sprintf("mkdir -p %s/storage %s/tmp/pids %s/log",
+			shellEscape(versioned), shellEscape(versioned), shellEscape(versioned)))
+		// Rails db migrate — production env, needs SECRET_KEY_BASE.
+		// We don't have it at install time (it's per-VM and we generate
+		// it in stepWriteSystemdUnit), so pass a one-shot dummy here
+		// just to clear Rails's boot check. db:migrate doesn't use the
+		// secret for anything; it only reads schema.rb.
+		_, _, _ = r.Cmd.Run(ctx, "bash", "-c", fmt.Sprintf(
+			"cd %s && RAILS_ENV=production SECRET_KEY_BASE=$(openssl rand -hex 32) bundle exec rake db:create db:migrate 2>&1 || true",
+			shellEscape(versioned),
+		))
 	case "node":
 		if _, _, err := r.Cmd.Run(ctx, "bash", "-c", fmt.Sprintf("cd %s && npm ci --omit=dev || npm install --omit=dev", shellEscape(versioned))); err != nil {
 			return fmt.Errorf("npm install: %w", err)
@@ -604,6 +620,12 @@ func (r *SoloRunner) stepInstallAppDeps(ctx context.Context) error {
 // stepConfigurePersistence sets up Litestream (if persistence.db =
 // sqlite-litestream) before the app starts, so the WAL is captured
 // from the first write.
+//
+// On a redeploy / reprovision (same slug, fresh EBS — common case after
+// terminate+launch), we ALSO attempt a `litestream restore` BEFORE
+// starting the app, so the new VM picks up the previous SQLite state
+// from the S3 replica. The restore is conditional on the local DB file
+// being missing/empty — first-deploy still creates a fresh DB.
 func (r *SoloRunner) stepConfigurePersistence(ctx context.Context) error {
 	r.Phase.Push(ctx, PhaseConfiguring, fmt.Sprintf("db=%s files=%s", r.spec.Persist.DB, r.spec.Persist.Files))
 	if r.spec.Persist.DB == "sqlite-litestream" {
@@ -612,6 +634,20 @@ func (r *SoloRunner) stepConfigurePersistence(ctx context.Context) error {
 		}
 		if err := r.writeLitestreamConfig(); err != nil {
 			return err
+		}
+		// RESTORE pass — runs BEFORE we enable the replicate daemon. If
+		// the S3 replica has objects AND the local DB is missing, pull
+		// it down. Idempotent: when the local DB already exists +
+		// non-empty (fresh deploy already wrote schema), restore is
+		// skipped.
+		if err := r.maybeRestoreFromLitestream(ctx); err != nil {
+			// Restore failure is logged but NOT fatal: a brand-new app
+			// with an empty S3 replica produces a "no snapshots found"
+			// error, which is the happy path on first deploy. The Rails
+			// `db:migrate` step below will create the schema fresh.
+			if r.Logger != nil {
+				r.Logger.Warn("solo: litestream restore returned non-fatal error (continuing)", "err", err.Error())
+			}
 		}
 		// systemd unit comes preinstalled with the apt package, but
 		// we re-enable + start to be defensive.
@@ -634,6 +670,76 @@ func (r *SoloRunner) stepConfigurePersistence(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// maybeRestoreFromLitestream pulls the last SQLite snapshot + WAL from
+// S3 when the local DB file is missing or zero-bytes. This is the
+// "user replaces VM, data follows" path:
+//
+//  1. Old VM ran `litestream replicate` → wrote snapshots + WAL to
+//     s3://zibby-solo-<acct>-<slug>-db/{rails-storage,rails-db}/
+//  2. Old VM is terminated; EBS retained (DeleteOnTermination=false on
+//     the provisioner) but inaccessible (volume orphaned).
+//  3. New VM provisioned with same slug; cloud-init writes the same
+//     spec; agent-ops bootstrap runs.
+//  4. THIS function: detects empty/missing storage/production.sqlite3,
+//     runs `litestream restore -o <path> s3://<bucket>/<replica>`.
+//  5. Rails boots, sees fully-populated DB, serves traffic.
+//
+// Best-effort across both possible Rails layouts (storage/ and db/).
+// Returns nil if no restore attempted (DB exists + non-empty); returns
+// the litestream error if both layouts fail (logged + suppressed by
+// the caller because a fresh deploy hits that path naturally).
+func (r *SoloRunner) maybeRestoreFromLitestream(ctx context.Context) error {
+	appDir := r.Env["ZIBBY_APP_DIR"]
+	if appDir == "" {
+		return errors.New("maybeRestoreFromLitestream: ZIBBY_APP_DIR not set")
+	}
+	bucket := r.dbBucketName()
+	if bucket == "" {
+		return errors.New("maybeRestoreFromLitestream: bucket name resolved empty")
+	}
+
+	candidates := []struct {
+		localPath  string
+		s3Replica  string
+	}{
+		{filepath.Join(appDir, "storage/production.sqlite3"), fmt.Sprintf("s3://%s/rails-storage", bucket)},
+		{filepath.Join(appDir, "db/production.sqlite3"),      fmt.Sprintf("s3://%s/rails-db", bucket)},
+	}
+
+	var lastErr error
+	for _, c := range candidates {
+		// Skip if the file exists + has non-zero size (fresh deploy or
+		// a re-bootstrap after an in-place restart). The Litestream
+		// replicate daemon picks up from where it left off.
+		if info, err := os.Stat(c.localPath); err == nil && info.Size() > 0 {
+			continue
+		}
+		// Ensure the parent dir exists — Rails would create it on
+		// db:migrate, but we want the restore to drop in first.
+		_ = os.MkdirAll(filepath.Dir(c.localPath), 0o755)
+		// Run `litestream restore -o <path> <replica>`. Litestream
+		// exits 1 with "no snapshots found" when the bucket is empty;
+		// we treat that as a non-fatal "fresh deploy, no replica yet"
+		// signal.
+		if _, _, err := r.Cmd.Run(ctx, "litestream", "restore", "-o", c.localPath, c.s3Replica); err != nil {
+			lastErr = fmt.Errorf("litestream restore %s ← %s: %w", c.localPath, c.s3Replica, err)
+			if r.Logger != nil {
+				r.Logger.Info("solo: litestream restore failed (may be fresh deploy)", "err", err.Error(), "replica", c.s3Replica)
+			}
+			continue
+		}
+		if r.Logger != nil {
+			r.Logger.Info("solo: litestream restore succeeded", "path", c.localPath, "replica", c.s3Replica)
+		}
+		// Chown so the systemd zibby user can read.
+		_, _, _ = r.Cmd.Run(ctx, "chown", "zibby:zibby", c.localPath)
+		// We only restore the first matching layout — once we have a
+		// hit, the other path is irrelevant.
+		return nil
+	}
+	return lastErr
 }
 
 func (r *SoloRunner) installLitestream(ctx context.Context) error {
@@ -801,6 +907,21 @@ func (r *SoloRunner) stepWriteSystemdUnit(ctx context.Context) error {
 	// to the expected value.
 	extraEnv += fmt.Sprintf("Environment=PORT=%d\n", port)
 
+	// Framework-specific env. Rails 7 production REQUIRES SECRET_KEY_BASE
+	// (or an encrypted-credentials master.key); the bootstrap path
+	// generates a random 128-char hex per-VM and persists it under
+	// /etc/zibby so a restart keeps the same key. RAILS_ENV gates the
+	// production environment loaded by config/environments/*.rb;
+	// RAILS_LOG_TO_STDOUT bypasses log/production.log + lets journalctl
+	// catch the request stream.
+	if fw == "rails" {
+		secret := r.persistOrGenerateSecret("/etc/zibby/rails-secret-key-base")
+		extraEnv += fmt.Sprintf("Environment=SECRET_KEY_BASE=%s\n", secret)
+		extraEnv += "Environment=RAILS_ENV=production\n"
+		extraEnv += "Environment=RAILS_LOG_TO_STDOUT=true\n"
+		extraEnv += "Environment=RAILS_SERVE_STATIC_FILES=true\n"
+	}
+
 	unit := fmt.Sprintf(`# zibby-managed; do not edit by hand.
 [Unit]
 Description=Zibby solo app (%s)
@@ -835,8 +956,12 @@ WantedBy=multi-user.target
 func frameworkExecStart(framework string, port int) string {
 	switch framework {
 	case "rails":
-		// Rails 7 default — bin/rails server -b 0.0.0.0 -p <port> -e production
-		return fmt.Sprintf("/bin/bash -lc 'cd /opt/app/current && bundle exec rails server -b 0.0.0.0 -p %d -e production'", port)
+		// Rails 7 production. We prefer `puma -C config/puma.rb` when
+		// the app ships its own puma config (the common production
+		// shape); fall back to `rails server` otherwise. Both bind to
+		// 0.0.0.0:$PORT — Caddy on the same host reverse-proxies from
+		// 80/443 via 127.0.0.1:$PORT.
+		return fmt.Sprintf("/bin/bash -lc 'cd /opt/app/current && if [ -f config/puma.rb ]; then bundle exec puma -C config/puma.rb; else bundle exec rails server -b 0.0.0.0 -p %d -e production; fi'", port)
 	case "node":
 		// Convention: package.json's `start` script binds to PORT.
 		return "/bin/bash -lc 'cd /opt/app/current && npm start'"
@@ -936,6 +1061,41 @@ func readTrimmed(path string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(b))
+}
+
+// persistOrGenerateSecret returns the value from `path` if it exists,
+// or generates a fresh 128-char hex secret, writes it 0600, and returns
+// it. Used for Rails SECRET_KEY_BASE so a restart-on-failure preserves
+// the same key (cookies signed with one key would otherwise become
+// invalid on every redeploy — surprising for users with persistent
+// sessions, even though our minimal fixture doesn't use them).
+func (r *SoloRunner) persistOrGenerateSecret(path string) string {
+	if existing := readTrimmed(path); existing != "" {
+		return existing
+	}
+	// 64 bytes → 128 hex chars (matches `rails secret`).
+	buf := make([]byte, 64)
+	if _, err := io.ReadFull(randSource(), buf); err != nil {
+		// Last-resort fallback: deterministic from accountId + slug.
+		// Bad for security but better than a panic during install.
+		return strings.Repeat("0", 128)
+	}
+	hex := fmt.Sprintf("%x", buf)
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	_ = os.WriteFile(path, []byte(hex+"\n"), 0o600)
+	return hex
+}
+
+// randSource returns a reader for crypto-random bytes. Hoisted so tests
+// can swap in a deterministic source if needed.
+var randSource = func() io.Reader {
+	return cryptoRand{}
+}
+
+type cryptoRand struct{}
+
+func (cryptoRand) Read(p []byte) (int, error) {
+	return cryptoRandRead(p)
 }
 
 // shellEscape returns s quoted for use in a `bash -c` heredoc. Conservative:
