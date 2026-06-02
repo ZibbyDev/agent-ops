@@ -72,6 +72,10 @@ talk to that daemon — they do NOT spawn one transiently.`,
 		newScheduleCmd(),
 		newMCPCmd(),
 		newIntegrateCmd(),
+		// `bootstrap --from-spec` — Zibby solo-mode entrypoint invoked
+		// by the AMI's systemd unit. Hidden from `--help` since humans
+		// don't type it directly.
+		newBootstrapCmd(),
 	)
 	return root
 }
