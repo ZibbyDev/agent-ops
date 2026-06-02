@@ -378,11 +378,17 @@ func (r *SoloRunner) Run(ctx context.Context) error {
 	if err := r.withTimeout(ctx, 15*time.Minute, r.stepInstallOSDeps); err != nil {
 		return fmt.Errorf("install-os: %w", err)
 	}
-	if err := r.withTimeout(ctx, 15*time.Minute, r.stepInstallAppDeps); err != nil {
-		return fmt.Errorf("install-app: %w", err)
-	}
+	// Persistence (Litestream restore + daemon) runs BEFORE app deps
+	// so a redeploy / reprovision sees the restored DB before
+	// db:migrate runs. db:migrate is idempotent — it skips if the
+	// schema_migrations row already exists, so a fresh deploy still
+	// works (empty S3 bucket → restore is no-op → db:create writes
+	// fresh).
 	if err := r.withTimeout(ctx, 5*time.Minute, r.stepConfigurePersistence); err != nil {
 		return fmt.Errorf("persistence: %w", err)
+	}
+	if err := r.withTimeout(ctx, 15*time.Minute, r.stepInstallAppDeps); err != nil {
+		return fmt.Errorf("install-app: %w", err)
 	}
 	if err := r.withTimeout(ctx, 2*time.Minute, r.stepConfigureCaddy); err != nil {
 		return fmt.Errorf("caddy: %w", err)
