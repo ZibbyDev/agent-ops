@@ -611,6 +611,14 @@ func (r *SoloRunner) stepInstallAppDeps(ctx context.Context) error {
 				"stdout_tail", lastN(out, 2048),
 			)
 		}
+		// db:migrate ran as root → SQLite file is root-owned. The
+		// systemd unit runs as zibby:zibby, which then can't write
+		// (SQLite3::ReadOnlyException). Re-chown the whole app dir
+		// (vendor/bundle + storage + everything Rails generated)
+		// so the runtime user has write access. Doing this AFTER
+		// the migrate is cheaper than running migrate as zibby (which
+		// requires sudo gymnastics + still creates root-owned tmpdirs).
+		_, _, _ = r.Cmd.Run(ctx, "chown", "-R", "zibby:zibby", versioned)
 	case "node":
 		if _, _, err := r.Cmd.Run(ctx, "bash", "-c", fmt.Sprintf("cd %s && npm ci --omit=dev || npm install --omit=dev", shellEscape(versioned))); err != nil {
 			return fmt.Errorf("npm install: %w", err)
