@@ -592,10 +592,25 @@ func (r *SoloRunner) stepInstallAppDeps(ctx context.Context) error {
 		// it in stepWriteSystemdUnit), so pass a one-shot dummy here
 		// just to clear Rails's boot check. db:migrate doesn't use the
 		// secret for anything; it only reads schema.rb.
-		_, _, _ = r.Cmd.Run(ctx, "bash", "-c", fmt.Sprintf(
-			"cd %s && RAILS_ENV=production SECRET_KEY_BASE=$(openssl rand -hex 32) bundle exec rake db:create db:migrate 2>&1 || true",
+		//
+		// Use `bundle exec rails db:...` instead of `rake` — bundles
+		// without an explicit Rakefile (smallest Rails skeletons) fall
+		// back to the bin/rails commander which already knows the
+		// db namespace. NOT fatal if it fails: a brand-new app with
+		// no migrations file will report "Nothing to migrate", which
+		// is harmless. We DO want the exit code surfaced via the log so
+		// "Could not find table" failures at first request are
+		// debuggable from CloudWatch.
+		out, _, err := r.Cmd.Run(ctx, "bash", "-c", fmt.Sprintf(
+			"cd %s && RAILS_ENV=production SECRET_KEY_BASE=$(openssl rand -hex 32) bundle exec rails db:create db:migrate 2>&1",
 			shellEscape(versioned),
 		))
+		if err != nil && r.Logger != nil {
+			r.Logger.Warn("solo: rails db:create db:migrate returned non-zero (continuing)",
+				"err", err.Error(),
+				"stdout_tail", lastN(out, 2048),
+			)
+		}
 	case "node":
 		if _, _, err := r.Cmd.Run(ctx, "bash", "-c", fmt.Sprintf("cd %s && npm ci --omit=dev || npm install --omit=dev", shellEscape(versioned))); err != nil {
 			return fmt.Errorf("npm install: %w", err)
