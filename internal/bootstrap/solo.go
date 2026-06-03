@@ -111,6 +111,7 @@ type SoloPaths struct {
 	AccountIDFile string // /etc/zibby/account-id
 	DeploymentID  string // /etc/zibby/deployment-id
 	StatusURL     string // /etc/zibby/status-url
+	PhaseToken    string // /etc/zibby/phase-token (per-deploy bearer for phase POSTs)
 	SecretsEnv    string // /etc/zibby/secrets.env
 	AppRoot       string // /opt/app
 	CurrentLink   string // /opt/app/current
@@ -129,6 +130,7 @@ func DefaultSoloPaths() SoloPaths {
 		AccountIDFile: "/etc/zibby/account-id",
 		DeploymentID:  "/etc/zibby/deployment-id",
 		StatusURL:     "/etc/zibby/status-url",
+		PhaseToken:    "/etc/zibby/phase-token",
 		SecretsEnv:    "/etc/zibby/secrets.env",
 		AppRoot:       "/opt/app",
 		CurrentLink:   "/opt/app/current",
@@ -156,6 +158,7 @@ type SoloRunner struct {
 	accountID    string
 	deploymentID string
 	statusURL    string
+	phaseToken   string // per-deploy bearer for phase POSTs (from PhaseToken file)
 }
 
 // commandRunner abstracts exec.Cmd so we can dry-run + assert in tests.
@@ -265,11 +268,19 @@ func NewSoloRunner(paths SoloPaths, logger *slog.Logger) (*SoloRunner, error) {
 	if err := r.load(); err != nil {
 		return nil, err
 	}
+	// Phase POST bearer: prefer the per-deployment token written to
+	// /etc/zibby/phase-token by the provisioner's userData (the backend
+	// stores only its SHA-256 hash + validates it). Fall back to
+	// AGENT_OPS_TOKEN for any environment that injects it via env instead.
+	phaseTok := r.phaseToken
+	if phaseTok == "" {
+		phaseTok = os.Getenv("AGENT_OPS_TOKEN")
+	}
 	r.Phase = httpPhaseReporter{
 		url:    r.statusURL,
 		client: r.HTTPClient,
 		logger: logger,
-		token:  os.Getenv("AGENT_OPS_TOKEN"),
+		token:  phaseTok,
 	}
 	return r, nil
 }
@@ -301,6 +312,9 @@ func (r *SoloRunner) load() error {
 	}
 	if b, err := os.ReadFile(r.Paths.DeploymentID); err == nil {
 		r.deploymentID = strings.TrimSpace(string(b))
+	}
+	if b, err := os.ReadFile(r.Paths.PhaseToken); err == nil {
+		r.phaseToken = strings.TrimSpace(string(b))
 	}
 	if b, err := os.ReadFile(r.Paths.StatusURL); err == nil {
 		r.statusURL = strings.TrimSpace(string(b))

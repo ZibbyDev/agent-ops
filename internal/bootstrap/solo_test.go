@@ -147,6 +147,7 @@ func TestSoloRunnerLoadParsesSpec(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "account-id"), "455456047181")
 	writeFile(t, filepath.Join(dir, "deployment-id"), "dep_abc123")
 	writeFile(t, filepath.Join(dir, "status-url"), "https://api-dev.zibby.app/apps/solo/hello/status")
+	writeFile(t, filepath.Join(dir, "phase-token"), "tok_secret_per_deploy\n")
 
 	r := &SoloRunner{
 		Paths: SoloPaths{
@@ -154,10 +155,16 @@ func TestSoloRunnerLoadParsesSpec(t *testing.T) {
 			AccountIDFile: filepath.Join(dir, "account-id"),
 			DeploymentID:  filepath.Join(dir, "deployment-id"),
 			StatusURL:     filepath.Join(dir, "status-url"),
+			PhaseToken:    filepath.Join(dir, "phase-token"),
 		},
 	}
 	if err := r.load(); err != nil {
 		t.Fatalf("load: %v", err)
+	}
+	// Per-deployment phase token is read + trimmed; it's the Bearer the
+	// reporter sends so the backend can hash-verify the phase POST.
+	if r.phaseToken != "tok_secret_per_deploy" {
+		t.Errorf("phaseToken: want tok_secret_per_deploy, got %q", r.phaseToken)
 	}
 	if r.spec.AppSlug != "hello" {
 		t.Errorf("AppSlug: want hello, got %s", r.spec.AppSlug)
