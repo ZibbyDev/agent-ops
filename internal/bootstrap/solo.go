@@ -121,6 +121,7 @@ type SoloPaths struct {
 	SystemdUnit   string // /etc/systemd/system/zibby-app.service
 	LitestreamCfg string // /etc/litestream.yml
 	FailedMarker  string // /etc/zibby/.failed
+	ExecWrapper   string // /usr/local/bin/zibby-app-exec
 }
 
 // DefaultSoloPaths returns the production paths. Tests override.
@@ -140,6 +141,7 @@ func DefaultSoloPaths() SoloPaths {
 		SystemdUnit:   "/etc/systemd/system/zibby-app.service",
 		LitestreamCfg: "/etc/litestream.yml",
 		FailedMarker:  "/etc/zibby/.failed",
+		ExecWrapper:   "/usr/local/bin/zibby-app-exec",
 	}
 }
 
@@ -416,6 +418,12 @@ func (r *SoloRunner) Run(ctx context.Context) error {
 	}
 	if err := r.withTimeout(ctx, 2*time.Minute, r.stepWriteSystemdUnit); err != nil {
 		return fmt.Errorf("systemd: %w", err)
+	}
+	// Install the remote-exec wrapper AFTER the unit is written: the
+	// wrapper reads the unit's Environment= block at invocation time, so
+	// it only needs the unit to exist on disk (it re-reads live, not baked).
+	if err := r.withTimeout(ctx, 1*time.Minute, r.stepInstallExecWrapper); err != nil {
+		return fmt.Errorf("exec-wrapper: %w", err)
 	}
 	if err := r.withTimeout(ctx, 2*time.Minute, r.stepStartService); err != nil {
 		return fmt.Errorf("start: %w", err)
@@ -1239,6 +1247,149 @@ func frameworkExecStart(framework string, port int, micro bool) string {
 		return "/bin/sleep infinity"
 	}
 	return "/bin/sleep infinity"
+}
+
+// execWrapperScript is the body of /usr/local/bin/zibby-app-exec.
+//
+// Contract: invoked as `zibby-app-exec <base64-of-shell-command>` by the
+// backend's SSM AWS-StartInteractiveCommand session (which runs it via
+// `sudo`, i.e. as root, and supplies an interactive PTY). It reproduces
+// the deployed app's EXACT runtime context — same working dir, same env,
+// same user — then execs the decoded command under a login shell so
+// `rails console`, `rails db:migrate`, `bash`, `psql`, etc. behave as if
+// the operator were sitting inside the running unit.
+//
+// Framework-agnostic: the env is derived from the live systemd unit
+// (`systemctl show -p Environment`) PLUS /etc/zibby/secrets.env, so it
+// always matches whatever stepWriteSystemdUnit baked in — no per-framework
+// knowledge here. Zibby-specific paths (/opt/app/current, /etc/zibby,
+// user `zibby`) are acceptable in this solo module.
+//
+// Memory: on the 0.5GB t4g.nano a `rails console` spawns a second full
+// app process (~150-300MB) alongside the live Puma. We run the command in
+// a transient systemd scope with MemoryHigh=200M (SOFT — throttles via the
+// 2GB swap stepMemoryTuning allocated rather than hard-killing) so it
+// cannot OOM-kill the live unit. MemoryMax=400M is a generous hard ceiling
+// well above MemoryHigh as a final backstop. If systemd-run is unavailable
+// we fall back to `nice` so the wrapper still works on non-systemd hosts.
+const execWrapperScript = `#!/usr/bin/env bash
+# zibby-managed; do not edit by hand.
+# zibby-app-exec <base64-shell-command> — run a command in the deployed
+# app's runtime context (cwd + env + user). Invoked as root via sudo by
+# the backend SSM broker, which supplies the interactive PTY.
+set -euo pipefail
+
+UNIT="zibby-app.service"
+APP_DIR="/opt/app/current"
+APP_USER="zibby"
+SECRETS_ENV="/etc/zibby/secrets.env"
+
+if [ "$#" -lt 1 ] || [ -z "${1:-}" ]; then
+  echo "zibby-app-exec: missing base64 command argument" >&2
+  exit 2
+fi
+
+# Decode the base64 payload → the shell command to run.
+CMD="$(printf '%s' "$1" | base64 -d)" || {
+  echo "zibby-app-exec: failed to base64-decode command" >&2
+  exit 2
+}
+
+if [ ! -d "$APP_DIR" ]; then
+  echo "zibby-app-exec: app dir $APP_DIR missing — is the app deployed?" >&2
+  exit 1
+fi
+
+# Reproduce the app's environment. Source of truth is the live systemd
+# unit (matches Environment= lines AND EnvironmentFile=) plus the secrets
+# file. We collect the KEY names to pass through to the dropped-privilege
+# shell via sudo --preserve-env, and export the values into THIS shell so
+# they're inherited.
+PRESERVE_KEYS=""
+# systemctl show -p Environment prints: Environment=K1=V1 K2=V2 ...
+# (space-separated, values may themselves contain '='; split on first '=').
+ENV_LINE="$(systemctl show -p Environment "$UNIT" 2>/dev/null || true)"
+ENV_LINE="${ENV_LINE#Environment=}"
+if [ -n "$ENV_LINE" ]; then
+  # Word-split on spaces (systemd quotes values containing spaces; the
+  # common DB/secret vars don't, so plain splitting is adequate + keeps
+  # this dependency-free).
+  for kv in $ENV_LINE; do
+    key="${kv%%=*}"
+    val="${kv#*=}"
+    [ -z "$key" ] && continue
+    export "$key=$val"
+    PRESERVE_KEYS="${PRESERVE_KEYS:+$PRESERVE_KEYS,}$key"
+  done
+fi
+# Source the EnvironmentFile too (EnvironmentFile=-… in the unit). set -a
+# so each assignment is auto-exported into this shell's env.
+if [ -f "$SECRETS_ENV" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$SECRETS_ENV"
+  set +a
+  # Add the secret keys to the preserve list.
+  while IFS='=' read -r k _; do
+    case "$k" in ''|\#*) continue;; esac
+    k="$(printf '%s' "$k" | tr -d '[:space:]')"
+    [ -z "$k" ] && continue
+    PRESERVE_KEYS="${PRESERVE_KEYS:+$PRESERVE_KEYS,}$k"
+  done < "$SECRETS_ENV"
+fi
+
+cd "$APP_DIR"
+
+# Build the privilege-drop invocation. --preserve-env=<keys> carries the
+# app's DB/secret env across the user switch (sudo otherwise scrubs it).
+# bash -lc gives a login shell so rbenv/asdf/bundle shims + PATH resolve
+# exactly as the unit's ExecStart sees them. stdin/stdout/stderr are NOT
+# redirected — the SSM session's PTY passes straight through.
+RUN=(sudo -u "$APP_USER")
+if [ -n "$PRESERVE_KEYS" ]; then
+  RUN+=("--preserve-env=$PRESERVE_KEYS")
+fi
+RUN+=(bash -lc "$CMD")
+
+# Memory containment: spawn inside a transient systemd scope with a SOFT
+# MemoryHigh so a heavy console/migration throttles into swap instead of
+# OOM-killing the live app. Fall back to nice if systemd-run is absent.
+if command -v systemd-run >/dev/null 2>&1; then
+  exec systemd-run --scope --quiet \
+    -p MemoryHigh=200M -p MemoryMax=400M \
+    "${RUN[@]}"
+else
+  exec nice -n 10 "${RUN[@]}"
+fi
+`
+
+// stepInstallExecWrapper writes /usr/local/bin/zibby-app-exec (mode 0755),
+// the framework-agnostic remote-exec wrapper the backend SSM broker runs.
+// Idempotent: os.WriteFile truncates + rewrites, so a re-bootstrap simply
+// refreshes the script to the current template. Placed in the solo module
+// (not generic/shared code) because it bakes Zibby-specific paths.
+//
+// Written from agent-ops (not the AMI) so the wrapper ships with each
+// bootstrap and isn't coupled to the AMI release cycle.
+func (r *SoloRunner) stepInstallExecWrapper(ctx context.Context) error {
+	r.Phase.Push(ctx, PhaseConfiguring, "exec-wrapper")
+	dst := r.Paths.ExecWrapper
+	if dst == "" {
+		dst = "/usr/local/bin/zibby-app-exec"
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("mkdir exec-wrapper dir: %w", err)
+	}
+	if err := os.WriteFile(dst, []byte(execWrapperScript), 0o755); err != nil {
+		return fmt.Errorf("write exec wrapper %s: %w", dst, err)
+	}
+	// WriteFile honours the umask; re-chmod so the bit is exactly 0755
+	// even under a restrictive umask (the backend invokes it via sudo, but
+	// 0755 keeps it inspectable/runnable for operators too).
+	if err := os.Chmod(dst, 0o755); err != nil {
+		return fmt.Errorf("chmod exec wrapper %s: %w", dst, err)
+	}
+	return nil
 }
 
 // stepStartService starts zibby-app.service. Returns once systemctl

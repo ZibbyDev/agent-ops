@@ -340,6 +340,64 @@ func TestStepMemoryTuningMicroInstallsJemallocAndSwap(t *testing.T) {
 	}
 }
 
+func TestStepInstallExecWrapperWritesExecutableScript(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "bin", "zibby-app-exec")
+	stub := newFakeCmd()
+	r := &SoloRunner{
+		Paths: SoloPaths{ExecWrapper: dst},
+		Cmd:   stub,
+		Env:   map[string]string{},
+		spec:  &SoloSpec{AppSlug: "hello"},
+	}
+	r.Phase = &fakePhase{}
+	if err := r.stepInstallExecWrapper(context.Background()); err != nil {
+		t.Fatalf("stepInstallExecWrapper: %v", err)
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("wrapper not written: %v", err)
+	}
+	// Must be executable (0755) — the SSM broker runs it via sudo.
+	if info.Mode().Perm() != 0o755 {
+		t.Errorf("wrapper mode: want 0755, got %o", info.Mode().Perm())
+	}
+	b, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(b)
+	// Load-bearing invariants of the contract.
+	for _, want := range []string{
+		"base64 -d",                              // decodes the arg
+		`UNIT="zibby-app.service"`,               // exact systemd unit name
+		`APP_DIR="/opt/app/current"`,             // verified working dir
+		`APP_USER="zibby"`,                       // drops to the app user
+		"systemctl show -p Environment",          // derives env from live unit
+		`. "$SECRETS_ENV"`,                       // sources secrets.env
+		"--preserve-env=",                        // carries env across sudo
+		"bash -lc",                               // login shell / interactive
+		"systemd-run --scope",                    // memory containment
+		"MemoryHigh=200M",                        // soft cap (throttle via swap)
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("exec wrapper missing %q", want)
+		}
+	}
+	// Idempotent: a second run rewrites cleanly with the same mode.
+	if err := r.stepInstallExecWrapper(context.Background()); err != nil {
+		t.Fatalf("second stepInstallExecWrapper: %v", err)
+	}
+}
+
+func TestStepInstallExecWrapperWiredIntoDefaultPaths(t *testing.T) {
+	// The production wrapper path must be set so Run() writes it to the
+	// canonical location the backend SSM broker invokes.
+	if got := DefaultSoloPaths().ExecWrapper; got != "/usr/local/bin/zibby-app-exec" {
+		t.Errorf("DefaultSoloPaths().ExecWrapper = %q, want /usr/local/bin/zibby-app-exec", got)
+	}
+}
+
 func TestPersistOrGenerateSecretIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "secret")
