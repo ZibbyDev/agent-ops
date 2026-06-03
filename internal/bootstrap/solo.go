@@ -1033,6 +1033,17 @@ func (r *SoloRunner) stepConfigureCaddy(ctx context.Context) error {
 	if domain == "" {
 		domain = fmt.Sprintf("%s.solo.zibby.app", r.spec.AppSlug)
 	}
+	// ACME CA is configurable (ZIBBY_ACME_CA) so this stays generic —
+	// an operator can point at ZeroSSL, an internal/private CA, or LE
+	// staging for dev. DEFAULT is Let's Encrypt PRODUCTION. Without an
+	// explicit acme_ca, caddy can latch onto stale/baked ACME state and
+	// issue a STAGING cert (untrusted → browsers + curl reject the
+	// handshake with "tlsv1 alert internal error"). Pinning the CA makes
+	// the issued cert deterministic.
+	acmeCA := r.Env["ZIBBY_ACME_CA"]
+	if acmeCA == "" {
+		acmeCA = "https://acme-v02.api.letsencrypt.org/directory"
+	}
 	// `:80` block allows HTTP→HTTPS redirect when running w/o public
 	// DNS yet (CI/test, IP-only access). The `<domain>` block does the
 	// real reverse proxy. Caddy resolves ACME against the public IP
@@ -1040,6 +1051,7 @@ func (r *SoloRunner) stepConfigureCaddy(ctx context.Context) error {
 	cfg := fmt.Sprintf(`# zibby-managed; do not edit by hand.
 {
     auto_https disable_redirects
+    acme_ca %s
 }
 
 %s {
@@ -1057,13 +1069,19 @@ func (r *SoloRunner) stepConfigureCaddy(ctx context.Context) error {
     reverse_proxy 127.0.0.1:%d
     encode gzip zstd
 }
-`, domain, port, port)
+`, acmeCA, domain, port, port)
 	if err := os.WriteFile(r.Paths.CaddyFile, []byte(cfg), 0o644); err != nil {
 		return fmt.Errorf("write Caddyfile: %w", err)
 	}
-	// Reload caddy so the new config kicks in. systemctl reload is a
-	// SIGUSR1 to caddy — no downtime.
-	_, _, _ = r.Cmd.Run(ctx, "systemctl", "reload", "caddy.service")
+	// Clear stale ACME account/cert state before (re)starting so caddy
+	// runs a clean order against the pinned CA — defends against a
+	// STAGING account baked into the AMI. Best-effort; harmless on a
+	// fresh box. reload won't drop in-memory state, so stop → clear →
+	// start.
+	_, _, _ = r.Cmd.Run(ctx, "systemctl", "stop", "caddy.service")
+	_, _, _ = r.Cmd.Run(ctx, "bash", "-c",
+		"rm -rf /var/lib/caddy/.local/share/caddy/acme /var/lib/caddy/.config/caddy/autosave.json 2>/dev/null || true")
+	_, _, _ = r.Cmd.Run(ctx, "systemctl", "start", "caddy.service")
 	return nil
 }
 
