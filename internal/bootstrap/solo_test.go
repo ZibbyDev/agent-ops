@@ -70,16 +70,6 @@ func (f *fakePhase) Push(_ context.Context, p SoloPhase, d string) {
 	f.got = append(f.got, phaseEvent{Phase: p, Detail: d})
 }
 
-func (f *fakePhase) phases() []SoloPhase {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]SoloPhase, len(f.got))
-	for i, e := range f.got {
-		out[i] = e.Phase
-	}
-	return out
-}
-
 // TestDetectFramework covers the file-presence detection used when
 // spec.framework='auto'. Order matters: Gemfile beats package.json.
 func TestDetectFramework(t *testing.T) {
