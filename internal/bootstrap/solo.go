@@ -1033,14 +1033,14 @@ func (r *SoloRunner) stepConfigureCaddy(ctx context.Context) error {
 	if domain == "" {
 		domain = fmt.Sprintf("%s.solo.zibby.app", r.spec.AppSlug)
 	}
-	// ACME CA is configurable (ZIBBY_ACME_CA) so this stays generic —
-	// an operator can point at ZeroSSL, an internal/private CA, or LE
-	// staging for dev. DEFAULT is Let's Encrypt PRODUCTION. Without an
-	// explicit acme_ca, caddy can latch onto stale/baked ACME state and
-	// issue a STAGING cert (untrusted → browsers + curl reject the
-	// handshake with "tlsv1 alert internal error"). Pinning the CA makes
-	// the issued cert deterministic.
-	acmeCA := r.Env["ZIBBY_ACME_CA"]
+	// ACME CA is configurable (AGENT_OPS_ACME_CA — vendor-neutral, matches
+	// the AGENT_OPS_TOKEN convention) so this stays generic for OSS: an
+	// operator can point at ZeroSSL, an internal/private CA, or LE staging
+	// for dev. DEFAULT is Let's Encrypt PRODUCTION. Without an explicit
+	// acme_ca, caddy can latch onto stale/baked ACME state and issue a
+	// STAGING cert (untrusted → browsers + curl reject the handshake with
+	// "tlsv1 alert internal error"). Pinning the CA makes it deterministic.
+	acmeCA := os.Getenv("AGENT_OPS_ACME_CA")
 	if acmeCA == "" {
 		acmeCA = "https://acme-v02.api.letsencrypt.org/directory"
 	}
