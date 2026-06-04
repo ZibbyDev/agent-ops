@@ -76,6 +76,9 @@ talk to that daemon — they do NOT spawn one transiently.`,
 		// by the AMI's systemd unit. Hidden from `--help` since humans
 		// don't type it directly.
 		newBootstrapCmd(),
+		// `proxy up` — Zibby shared-ingress entrypoint invoked by the
+		// cloud provisioner's UserData. Hidden (infra-invoked, not human).
+		newProxyCmd(),
 	)
 	return root
 }
