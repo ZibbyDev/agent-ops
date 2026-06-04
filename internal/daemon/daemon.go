@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -119,7 +120,16 @@ func Run(cfgPath, version string, logger *slog.Logger) error {
 	if err := sched.Hydrate(ctx, cfg); err != nil {
 		return fmt.Errorf("scheduler.Hydrate: %w", err)
 	}
-	sched.Start()
+	// Gate the AUTONOMOUS scheduler (and first-run below). The daemon itself
+	// always comes up — MCP server, `zibby app run`, log tailing all work
+	// regardless. We only skip starting scheduled agent runs when the app
+	// has agent-ops turned off, or when there's no Claude token to run with.
+	schedOn, schedReason := schedulerGate(cfg)
+	if schedOn {
+		sched.Start()
+	} else {
+		logger.Info("agent-ops scheduler idle (not started)", "reason", schedReason)
+	}
 
 	// Per-instance EFS usage emitter.
 	disku.Start(ctx, logger, cfg.StateDir, 60*time.Second)
@@ -153,9 +163,15 @@ func Run(cfgPath, version string, logger *slog.Logger) error {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// First-run bootstrap — sync; failure exits the daemon.
-	if err := bootstrap.MaybeRunFirstRun(ctx, cfg, sched, store); err != nil {
-		return fmt.Errorf("bootstrap: %w", err)
+	// First-run bootstrap — sync; failure exits the daemon. Skipped when the
+	// scheduler is gated off (disabled or no token), same as the scheduled
+	// runs above — a paused / token-less app must not kick off agent work.
+	if schedOn {
+		if err := bootstrap.MaybeRunFirstRun(ctx, cfg, sched, store); err != nil {
+			return fmt.Errorf("bootstrap: %w", err)
+		}
+	} else {
+		logger.Info("first-run bootstrap skipped (scheduler idle)", "reason", schedReason)
 	}
 
 	httpErr := make(chan error, 1)
@@ -179,6 +195,48 @@ func Run(cfgPath, version string, logger *slog.Logger) error {
 			n.Touch()
 		}
 	}
+}
+
+// schedulerGate decides whether the autonomous scheduler + first-run should
+// run. Returns (run, reason). It never affects whether the daemon starts —
+// only whether agent-ops fires scheduled / first-run agent activity.
+//
+// Two reasons to idle:
+//  1. AGENT_OPS_SCHEDULER_ENABLED is explicitly falsey (false/0/off/no/
+//     disabled) — the Zibby dashboard's per-app agent-ops toggle sets this
+//     on the task-def / instance env so users can pause agent-ops without
+//     destroying the app.
+//  2. No Claude token is configured — scheduled runs would only fail, so we
+//     idle rather than crash-loop. "Run if a token is present; don't if it
+//     isn't." The daemon stays up so the app keeps serving + `zibby app run`
+//     still works (interactive runs supply their own token at exec time).
+func schedulerGate(cfg *config.Config) (bool, string) {
+	if v := strings.TrimSpace(os.Getenv("AGENT_OPS_SCHEDULER_ENABLED")); v != "" {
+		switch strings.ToLower(v) {
+		case "false", "0", "off", "no", "disabled":
+			return false, "AGENT_OPS_SCHEDULER_ENABLED=" + v
+		}
+	}
+	if !hasAgentToken(cfg) {
+		return false, "no Claude token configured (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY unset)"
+	}
+	return true, ""
+}
+
+// hasAgentToken reports whether any Claude credential the scheduler could run
+// with is present in the environment: the claude-cli OAuth token, the
+// api-key path, or whatever env the config names.
+func hasAgentToken(cfg *config.Config) bool {
+	envs := []string{"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"}
+	if cfg != nil && strings.TrimSpace(cfg.Agent.APIKeyEnv) != "" {
+		envs = append(envs, cfg.Agent.APIKeyEnv)
+	}
+	for _, e := range envs {
+		if strings.TrimSpace(os.Getenv(e)) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func buildDriver(cfg *config.Config) (driver.Driver, error) {
