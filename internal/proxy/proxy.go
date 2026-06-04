@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -111,10 +112,10 @@ func RenderCaddyfile(c Config) string {
 	if c.AskURL != "" {
 		fmt.Fprintf(&b, "        ask %s\n", c.AskURL)
 	}
-	// Conservative rate caps so a burst of new hosts can't blow the ACME
-	// limit (the `ask` gate is the primary defense; these are belt+braces).
-	b.WriteString("        interval 2m\n")
-	b.WriteString("        burst    5\n")
+	// NOTE: the on_demand_tls `interval`/`burst` rate-cap options were REMOVED
+	// in Caddy v2.10+ (parsing them is now a hard error). The `ask` endpoint is
+	// the authorization gate (only registered active shared hosts get a cert),
+	// so it remains the primary + sufficient defense against ACME abuse.
 	b.WriteString("    }\n")
 	b.WriteString("}\n\n")
 
@@ -195,7 +196,29 @@ func WriteConfig(c Config) error {
 		return fmt.Errorf("write Caddyfile: %w", err)
 	}
 	// Ensure the map file exists so the first `caddy validate` / start
-	// doesn't fail on a missing import target.
+	// doesn't fail on a missing import target. The rendered Caddyfile does
+	// `import <MapPath>` inside the `map` directive; Caddy fails to LOAD when
+	// that path is missing — which is exactly what strands the proxy after a
+	// reboot (the map lives on the boot disk and is otherwise only written by
+	// the sync loop, which on a fresh/rebooted box hasn't run yet). An EMPTY
+	// map file is a valid `import` target (zero routes => every host 502s,
+	// the intended no-routes UX) so Caddy loads cleanly. Use EnsureMapFile so
+	// the create-if-absent semantics live in one place (also called by Setup).
+	return EnsureMapFile(c)
+}
+
+// EnsureMapFile guarantees the upstreams map file exists (creating an EMPTY
+// one if absent) so the Caddyfile's `import <MapPath>` never fails on a fresh
+// or rebooted box. An empty file is a valid Caddy `import` target. Idempotent:
+// an existing map (any content) is left untouched. Split out from WriteConfig
+// so Setup can assert it independently and so it's unit-testable.
+func EnsureMapFile(c Config) error {
+	if c.MapPath == "" {
+		c.MapPath = "/etc/caddy/upstreams.map"
+	}
+	if err := os.MkdirAll(filepath.Dir(c.MapPath), 0o755); err != nil {
+		return fmt.Errorf("mkdir for map file: %w", err)
+	}
 	if _, err := os.Stat(c.MapPath); err != nil {
 		if err := os.WriteFile(c.MapPath, []byte(""), 0o644); err != nil {
 			return fmt.Errorf("write map file: %w", err)
@@ -241,25 +264,111 @@ func reloadCaddy(ctx context.Context, caddyfile string) error {
 	return nil
 }
 
-// Up is the one-shot entrypoint the CLI / UserData calls: render config,
-// start the route-sync loop, and block. On a fresh boot it writes the
-// Caddyfile, ensures caddy is running, then loops Sync at SyncInterval.
+// setupRunner runs a command and returns combined output + error. Swappable
+// in tests (mirrors natCmdRunner) so Setup's systemctl/NAT calls can be
+// asserted without touching the host. Production uses execRunner.
+var setupRunner natRunner = execRunner
+
+// Setup performs the SYNCHRONOUS boot/startup work the proxy needs BEFORE it
+// can enter the route-sync loop, IN A FIXED ORDER, and never hangs:
+//
+//	(a) render + write the Caddyfile,
+//	(b) ensure /etc/caddy/upstreams.map exists (empty if absent) so Caddy's
+//	    `import` doesn't fail on a fresh/rebooted box,
+//	(c) reload-or-restart caddy AND verify it became active (log loudly if not),
+//	(d) if NAT is enabled, EnableNAT (ip_forward + MASQUERADE, idempotent).
+//
+// It is fail-LOUD-but-NON-HANGING: a step that fails is logged and the next
+// step still runs (a box that can't, say, persist a sysctl can still serve
+// inbound). This is the root-cause fix for "proxy up hangs without setting up
+// Caddy/NAT": previously the *only* startup path was Up(), which (1) ran
+// `systemctl enable --now caddy.service` — a no-op if caddy was already
+// loaded with a stale/broken config (it neither reloads nor restarts), (2)
+// ignored the result entirely (`_ =`) and never verified caddy came up, and
+// (3) the SSM/route lookups upstream could block on a not-yet-ready network.
+// Setup ALWAYS completes the Caddy + NAT work before any blocking sync.
+//
+// nat controls step (d); callers pass the resolved AGENT_OPS_PROXY_NAT
+// decision (kept a param so internal/proxy stays env-free).
+func Setup(ctx context.Context, c Config, nat bool, logf func(string, ...any)) {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	// (a) Caddyfile + (b) map file. WriteConfig does both (and EnsureMapFile
+	// is also called directly below as belt+braces in case a custom path was
+	// supplied). A write failure here is loud but we still try to (re)start
+	// caddy — it may already have a usable on-disk config.
+	if err := WriteConfig(c); err != nil {
+		logf("proxy: WriteConfig failed (continuing): %v", err)
+	}
+	if err := EnsureMapFile(c); err != nil {
+		logf("proxy: ensure upstreams.map failed (continuing): %v", err)
+	}
+
+	// (c) reload-or-restart caddy and VERIFY it became active. `reload-or-
+	// restart` reloads if running (zero-downtime), starts it if not — exactly
+	// the behavior we want on both a fresh boot and a config change. We do NOT
+	// use `enable --now` (the old bug: it won't re-read a changed config on an
+	// already-loaded unit). enable is for boot-persistence and is handled by
+	// the systemd unit in UserData, not here.
+	if out, err := setupRunner(ctx, "systemctl", "reload-or-restart", "caddy.service"); err != nil {
+		logf("proxy: systemctl reload-or-restart caddy failed (continuing): %v: %s",
+			err, strings.TrimSpace(string(out)))
+	} else {
+		logf("proxy: caddy reload-or-restart ok")
+	}
+	// Verify active. is-active prints "active" and exits 0 when up; anything
+	// else is a loud warning (NOT fatal — we still serve sync + NAT, and the
+	// systemd Restart=always on our own unit plus a future Sync reload give
+	// caddy more chances).
+	if out, err := setupRunner(ctx, "systemctl", "is-active", "caddy.service"); err != nil ||
+		strings.TrimSpace(string(out)) != "active" {
+		logf("proxy: WARNING caddy is not active after reload-or-restart (state=%q err=%v); "+
+			"the proxy will keep retrying via the sync loop",
+			strings.TrimSpace(string(out)), err)
+	} else {
+		logf("proxy: caddy is active")
+	}
+
+	// (d) NAT — idempotent. EnableNAT is itself best-effort + non-hanging.
+	if nat {
+		logf("proxy: NAT enabled; configuring ip_forward + MASQUERADE")
+		if err := EnableNAT(ctx, logf); err != nil {
+			logf("proxy: NAT setup had an error (continuing): %v", err)
+		}
+	}
+}
+
+// Up is the entrypoint the CLI / UserData (via the systemd unit) calls: do the
+// synchronous Setup (Caddyfile + map + caddy + NAT) FIRST, then run the
+// route-sync loop and block. Setup ALWAYS completes before the loop, so a
+// missing/empty routes table, a missing control-plane param, or a transient
+// AWS error in the loop can never strand the Caddy/NAT bring-up.
+//
+// nat carries the resolved AGENT_OPS_PROXY_NAT decision (the CLI reads the env
+// and passes it here so this package stays env-free).
 //
 // PHASE 1: with no MapSource wired, this renders a working on_demand_tls
 // front door that 502s every host (no routes yet) — proving the proxy +
 // ask-gate path end to end without migrating any real app onto it. Phase 2
 // installs the DDB MapSource and starts populating routes on app lifecycle.
-func Up(ctx context.Context, c Config) error {
-	if err := WriteConfig(c); err != nil {
-		return err
-	}
-	// Start caddy if it isn't already running under systemd. Best-effort —
-	// on the solo AMI caddy.service exists; elsewhere the operator manages it.
-	_ = exec.CommandContext(ctx, "systemctl", "enable", "--now", "caddy.service").Run()
+func Up(ctx context.Context, c Config, nat bool) error {
+	// SETUP FIRST — synchronous, fail-loud, non-hanging.
+	Setup(ctx, c, nat, func(f string, a ...any) {
+		fmt.Fprintf(os.Stderr, f+"\n", a...)
+	})
+
+	// Initial sync is best-effort: the route source may be unwired (Phase 1),
+	// the table empty, or AWS transiently unreachable. NEVER fatal — Setup has
+	// already brought up Caddy + NAT; the loop just keeps routes fresh.
 	if _, err := Sync(ctx, c); err != nil {
-		// Non-fatal on first run (source may be unwired in Phase 1).
-		fmt.Fprintf(os.Stderr, "proxy: initial sync: %v\n", err)
+		fmt.Fprintf(os.Stderr, "proxy: initial sync (non-fatal): %v\n", err)
 	}
+
+	// Route-sync loop. TOLERATES missing/empty routes table, missing
+	// control-plane param, and transient AWS errors: every Sync error is
+	// logged and we keep ticking (the ticker is our backoff). The loop never
+	// returns except on context cancellation.
 	t := time.NewTicker(c.SyncInterval)
 	defer t.Stop()
 	for {
@@ -268,7 +377,7 @@ func Up(ctx context.Context, c Config) error {
 			return ctx.Err()
 		case <-t.C:
 			if _, err := Sync(ctx, c); err != nil {
-				fmt.Fprintf(os.Stderr, "proxy: sync: %v\n", err)
+				fmt.Fprintf(os.Stderr, "proxy: sync (non-fatal, will retry): %v\n", err)
 			}
 		}
 	}

@@ -19,11 +19,22 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ZibbyHQ/agent-ops/internal/proxy"
 )
+
+// ssmResolveTimeout caps the SSM-param resolution at startup. On a fresh or
+// rebooted box the network / instance metadata / AWS CLI may not be ready
+// immediately; an UNBOUNDED `aws ssm get-parameter` would BLOCK `proxy up`
+// before it ever reaches proxy.Up -> Setup (the Caddy + NAT bring-up). This
+// was a root cause of "proxy up hangs without setting up Caddy/NAT". We bound
+// it and, on timeout/failure, log + continue (the proxy still serves; the
+// on_demand `ask` just denies until the param resolves on a later boot/restart
+// — Restart=always on the systemd unit gives us those retries).
+const ssmResolveTimeout = 15 * time.Second
 
 func newProxyCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -47,10 +58,18 @@ func newProxyUpCmd() *cobra.Command {
 			// *_PARAM name is, resolve it via the `aws` CLI (keeps this
 			// binary SDK-free + OSS-generic — any operator with the AWS CLI
 			// + an instance role can use it).
+			//
+			// BOUNDED: each lookup is capped by ssmResolveTimeout so a not-
+			// yet-ready network on (re)boot can't hang `proxy up` before it
+			// reaches proxy.Up -> Setup (Caddy + NAT). A miss is logged +
+			// skipped; the proxy still serves (on_demand `ask` denies until
+			// the param resolves on a later restart).
 			if c.AskURL == "" {
 				if p := os.Getenv("AGENT_OPS_PROXY_ASK_PARAM"); p != "" {
 					if v, err := ssmGet(cmd, p, c.Region); err == nil && v != "" && v != "UNSET" {
 						c.AskURL = v
+					} else if err != nil {
+						fmt.Fprintf(os.Stderr, "proxy: resolve ask param %s (continuing, ask denies until set): %v\n", p, err)
 					}
 				}
 			}
@@ -58,6 +77,8 @@ func newProxyUpCmd() *cobra.Command {
 				if p := os.Getenv("AGENT_OPS_PROXY_CP_PARAM"); p != "" {
 					if v, err := ssmGet(cmd, p, c.Region); err == nil && v != "" && v != "UNSET" {
 						c.ControlPlaneBaseURL = v
+					} else if err != nil {
+						fmt.Fprintf(os.Stderr, "proxy: resolve control-plane param %s (continuing): %v\n", p, err)
 					}
 				}
 			}
@@ -68,11 +89,25 @@ func newProxyUpCmd() *cobra.Command {
 			// SDK-free — it shells `aws dynamodb scan` (same convention as
 			// ssmGet above), keeping the binary OSS-generic. When no
 			// RoutesTable is configured we leave the source unset (Phase 1
-			// behavior: 502 every host until a source is wired).
+			// behavior: 502 every host until a source is wired). A scan that
+			// errors at runtime is tolerated by the sync loop (logged +
+			// retried), never blocking the initial Caddy/NAT Setup.
 			if c.RoutesTable != "" {
 				proxy.SetMapSource(ddbRouteSource(c.RoutesTable, c.Region))
 			}
-			return proxy.Up(cmd.Context(), c)
+			// NAT: the proxy box doubles as a NAT gateway for a sibling
+			// private subnet (private backends get apt/git egress through us
+			// instead of a separate managed NAT gateway). Opt-in via
+			// AGENT_OPS_PROXY_NAT=1 so a pure-ingress proxy doesn't touch the
+			// host firewall. The actual EnableNAT now runs INSIDE proxy.Up ->
+			// Setup, AFTER Caddy is brought up and BEFORE the sync loop, so the
+			// setup ordering (Caddy + map + NAT) is guaranteed regardless of
+			// caller. Here we only resolve the env decision and hand it to Up.
+			nat := false
+			if v := os.Getenv("AGENT_OPS_PROXY_NAT"); v == "1" || v == "true" {
+				nat = true
+			}
+			return proxy.Up(cmd.Context(), c, nat)
 		},
 	}
 }
@@ -84,7 +119,9 @@ func newProxyUpCmd() *cobra.Command {
 // AWS CLI + an instance role granting dynamodb:Scan on the table can use it.
 //
 // Item shape (control-plane SCHEMA, ingress-routes-store.js):
-//   host "<host>"  upstream "<ip:port>"  status "active"|...  mode "shared"|...
+//
+//	host "<host>"  upstream "<ip:port>"  status "active"|...  mode "shared"|...
+//
 // We project only host+upstream+status+mode and keep rows where
 // status==active && mode==shared (a paused/dedicated row is dropped => the
 // proxy 502s that host, same UX as a deleted route).
@@ -157,7 +194,12 @@ func ssmGet(cmd *cobra.Command, name, region string) (string, error) {
 	if region != "" {
 		args = append(args, "--region", region)
 	}
-	out, err := exec.CommandContext(cmd.Context(), "aws", args...).Output()
+	// Bounded so a not-yet-ready network/metadata on (re)boot can't hang the
+	// proxy bring-up. On timeout the context kills the child `aws` process and
+	// we return an error the caller logs + tolerates.
+	ctx, cancel := context.WithTimeout(cmd.Context(), ssmResolveTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "aws", args...).Output()
 	if err != nil {
 		return "", fmt.Errorf("aws ssm get-parameter %s: %w", name, err)
 	}
