@@ -776,9 +776,16 @@ func superviseScript(ctx context.Context, in superviseConfig) (res superviseResu
 			procStatus = "RUNNING"
 		}
 		tailNow := tailBytesFrom(&tail, liveTailBytes)
-		bytesSince := liveBytes - prevLiveBytes
-		prevLiveBytes = liveBytes
-		idle := time.Since(lastGrow)
+		// liveBytes and lastGrow are mutated by the stream goroutines under
+		// streamMu (see writeLine); take the same lock to read them so the
+		// race detector stays quiet when a kill races a final stream write.
+		streamMu.Lock()
+		curLiveBytes := liveBytes
+		curLastGrow := lastGrow
+		streamMu.Unlock()
+		bytesSince := curLiveBytes - prevLiveBytes
+		prevLiveBytes = curLiveBytes
+		idle := time.Since(curLastGrow)
 
 		// Short-circuit: process exited 0 AND verify port already serving
 		// is a definitive success — don't burn supervisor turns asking
