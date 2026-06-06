@@ -24,7 +24,13 @@ agent:
   #   per-task `model:` (schedule or bootstrap) → agent.model (this line).
   model: claude-haiku-4-5-20251001
   api_key_env: ANTHROPIC_API_KEY    # ignored when provider=claude-cli
-  max_tool_calls_per_task: 25
+  # Bumped 25 → 80 in 0.5.0: a real version upgrade (detect new release →
+  # read changelog → trigger the platform upgrade → poll health) plus the
+  # hourly/daily ops headroom exceeds 25 turns; live testing showed the
+  # weekly_upgrade agent hit the 25-turn cap mid-run (after detection, before
+  # the upgrade completed). Heavy work (the build) is delegated to the control
+  # plane, so this budget is for orchestration + verification, not compiling.
+  max_tool_calls_per_task: 80
   # Bumped from 20m → 30m in 0.3.6: bootstrap tasks like "install n8n"
   # routinely hit 20-25 min on slow npm CDN days plus Claude API latency;
   # the LLM also pauses mid-think waiting on Anthropic. Bumping gives
@@ -98,14 +104,27 @@ schedules:
     # release-note reading — escalate to Sonnet over the Haiku default.
     model: claude-sonnet-4-6
     prompt: |
-      Check upstream for a new release of the host application.
-      If one exists:
-        1. Snapshot current state (or note rollback procedure).
-        2. Pull the new version.
-        3. Run smoke tests.
-        4. If anything fails, roll back and explain what went wrong.
-           Then shell-out to your notification CLI (e.g. on Zibby flavour
-           images: `zibby workflow trigger notify-upgrade-failed
-           --input error="…"`) so the on-call sees it.
-        5. If everything passes, summarize what changed.
+      Check whether a newer version of THIS app is available. Compare the
+      running version (ask the app's /version or its CLI) against the target:
+      upgrade ONLY to the version this instance's catalog pins — do NOT chase
+      `latest` upstream (the control plane owns version selection).
+
+      If a newer target version exists, DO NOT build it yourself in this
+      container — it is the small runtime container and lacks the build
+      toolchain/resources. Instead trigger the PLATFORM upgrade, which rebuilds
+      the new version in a proper build task and swaps the service atomically:
+
+        1. POST to the upgrade endpoint:
+             curl -fsS -X POST \
+               -H "Authorization: Bearer $ZIBBY_PAT_TOKEN" \
+               -H "Content-Type: application/json" \
+               -d "{\"targetVersion\":\"<the target tag>\"}" \
+               "$ZIBBY_API_BASE_URL/apps/$INSTANCE_ID/upgrade-version"
+           (omit targetVersion to use the catalog's current pinned version.)
+        2. Poll the app's health endpoint until the NEW version is serving
+           healthy (give the platform a few minutes — it runs a fresh build).
+        3. If it does not come healthy, the platform did not auto-roll-back —
+           shell-out to your notification CLI so the on-call sees it:
+             zibby workflow trigger notify-upgrade-failed --input error="…"
+        4. Summarize what changed (from-version → to-version, health result).
     tools: [shell]
