@@ -99,32 +99,49 @@ func Run(cfgPath, version string, logger *slog.Logger) error {
 	defer mcpMgr.Close()
 	registerRemoteTools(tools, started, logger)
 
-	// Driver
-	d, err := buildDriver(cfg)
-	if err != nil {
-		return fmt.Errorf("driver: %w", err)
+	// Gate the AUTONOMOUS scheduler (and first-run below). The daemon itself
+	// always comes up — MCP server, `zibby app run`, log tailing all work
+	// regardless. We only skip starting scheduled agent runs when the app
+	// has agent-ops turned off, or when there's no Claude token to run with.
+	//
+	// IMPORTANT: this gate is evaluated BEFORE buildDriver. The driver
+	// factory for claude-cli / codex runs a Preflight() that requires the
+	// vendor CLI binary on PATH; a token-less box (or one without the CLI
+	// installed — e.g. a Zibby SOLO VM where agent-ops is turned off, or
+	// before a Claude token has been provisioned) must NOT crash-loop the
+	// daemon on driver construction. So we only build the driver when the
+	// scheduler is actually going to run. When the scheduler is gated off the
+	// daemon still comes up fully (MCP server, heartbeat, etc.) with a nil
+	// runner — there is no scheduled work to run, so the runner is never
+	// dereferenced. This honors the documented contract above and is what
+	// makes SOLO's persistent agent-opsd safe to ship by default.
+	schedOn, schedReason := schedulerGate(cfg)
+
+	var runner *task.Runner
+	if schedOn {
+		// Driver — only constructed when the scheduler will run, because the
+		// claude-cli / codex Preflight requires the vendor CLI binary.
+		d, derr := buildDriver(cfg)
+		if derr != nil {
+			return fmt.Errorf("driver: %w", derr)
+		}
+		runner = task.NewRunner(d, tools, store)
+		runner.MaxToolCalls = cfg.Agent.MaxToolCallsPerTask
+		if cfg.Agent.TaskTimeout > 0 {
+			runner.TaskTimeout = cfg.Agent.TaskTimeout
+		}
+		runner.Reporter = runreport.NewHTTPReporter()
 	}
 
-	// Task runner
-	runner := task.NewRunner(d, tools, store)
-	runner.MaxToolCalls = cfg.Agent.MaxToolCallsPerTask
-	if cfg.Agent.TaskTimeout > 0 {
-		runner.TaskTimeout = cfg.Agent.TaskTimeout
-	}
-	runner.Reporter = runreport.NewHTTPReporter()
-
-	// Scheduler
+	// Scheduler. Hydrate seeds the cron jobs from config regardless of the
+	// gate (so `agent-ops schedule` / the MCP server can list them), but we
+	// only Start() the cron loop + first-run when the gate is open.
 	sched := scheduler.New(runner, store, logger)
 	ctx, cancel := signalContext()
 	defer cancel()
 	if err := sched.Hydrate(ctx, cfg); err != nil {
 		return fmt.Errorf("scheduler.Hydrate: %w", err)
 	}
-	// Gate the AUTONOMOUS scheduler (and first-run below). The daemon itself
-	// always comes up — MCP server, `zibby app run`, log tailing all work
-	// regardless. We only skip starting scheduled agent runs when the app
-	// has agent-ops turned off, or when there's no Claude token to run with.
-	schedOn, schedReason := schedulerGate(cfg)
 	if schedOn {
 		sched.Start()
 	} else {

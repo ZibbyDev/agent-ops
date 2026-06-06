@@ -25,10 +25,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/ZibbyHQ/agent-ops/examples"
 	"github.com/ZibbyHQ/agent-ops/internal/scheduler"
@@ -149,12 +153,91 @@ func loadAllowedOrigins() map[string]struct{} {
 	return out
 }
 
-// Handler returns the http.Handler implementing the Streamable HTTP transport.
+// Handler returns the http.Handler the daemon mounts on its single public
+// port (AGENT_OPS_OPS_PORT, default 7842).
+//
+// SINGLE IN-TASK FRONT. The Zibby fleet ALB has a hard, non-adjustable cap of
+// 100 target groups per ALB. The old design registered TWO target groups +
+// TWO listener rules per app (one for the user app port, one for this daemon's
+// ops/MCP port), which capped cloud apps at ~50 (100 TGs / 2). To break that
+// ceiling at zero new standing cost we collapse to ONE TG + ONE rule per app
+// by making this always-running daemon the sole front for the whole task:
+//
+//   /_zibby_ops/mcp      → the MCP JSON-RPC + SSE handler (the control plane
+//                          proxies POST https://<subdomain>/_zibby_ops/mcp).
+//   /_zibby_ops/healthz  → liveness for the ALB target-group health check.
+//   /healthz             → kept as a back-compat alias (legacy ops TG used it).
+//   everything else      → reverse-proxied to the user app on
+//                          127.0.0.1:AGENT_OPS_APP_PORT.
+//
+// The reverse proxy supports WebSocket/SSE upgrades and long-lived streams
+// (FlushInterval < 0 flushes immediately; the daemon's http.Server sets no
+// WriteTimeout) so n8n, code-server, grafana, etc. work through the front.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/mcp", s.handleMCP)
+
+	// Health: serve under the ops prefix (the new single TG health-checks
+	// /_zibby_ops/healthz) AND at the bare /healthz for back-compat with the
+	// legacy ops target group, which health-checked /healthz directly.
+	mux.HandleFunc(APIPrefix+"/healthz", s.handleHealth)
 	mux.HandleFunc("/healthz", s.handleHealth)
+
+	// MCP under the prefix the control plane actually calls. ALB `forward`
+	// actions do not strip path prefixes, so the daemon must serve the full
+	// /_zibby_ops/mcp path itself.
+	mux.HandleFunc(APIPrefix+"/mcp", s.handleMCP)
+	// Keep the bare /mcp mount too so local/in-container callers and tests
+	// that hit the daemon directly (no ALB prefix) keep working.
+	mux.HandleFunc("/mcp", s.handleMCP)
+
+	// Catch-all: reverse-proxy every non-ops path to the user app port.
+	mux.Handle("/", s.appReverseProxy())
 	return mux
+}
+
+// APIPrefix is the path prefix the Zibby fleet ALB forwards control-plane
+// (ops) traffic under. Must stay in sync with APPS_DAEMON_OPS_PATH_PREFIX in
+// backend/src/handlers/apps.js.
+const APIPrefix = "/_zibby_ops"
+
+// appReverseProxy builds the catch-all reverse proxy to the user app port
+// (AGENT_OPS_APP_PORT on 127.0.0.1). When the app port is unknown/unset the
+// handler returns 503 (the app hasn't registered a port yet) rather than
+// panicking.
+func (s *Server) appReverseProxy() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw := strings.TrimSpace(os.Getenv("AGENT_OPS_APP_PORT"))
+		if raw == "" {
+			http.Error(w, "app port not yet known", http.StatusServiceUnavailable)
+			return
+		}
+		target, err := url.Parse("http://127.0.0.1:" + raw)
+		if err != nil {
+			http.Error(w, "bad app port", http.StatusBadGateway)
+			return
+		}
+		rp := httputil.NewSingleHostReverseProxy(target)
+		// FlushInterval < 0 flushes writes to the client immediately — required
+		// for SSE / streaming responses (code-server terminals, n8n executions)
+		// to not buffer. WebSocket upgrades are proxied transparently by
+		// httputil since Go 1.12 (Connection: Upgrade is honored).
+		rp.FlushInterval = -1
+		rp.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, e error) {
+			// Mirror the pre-front behavior: a not-yet-listening app surfaced
+			// as a 502 from the ALB. Keep that semantic here.
+			s.log.Warn("app reverse-proxy upstream error", "err", e, "target", target.String())
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		}
+		// Tighten the upstream dial so a wedged app fails fast instead of
+		// hanging the front (and the ALB health check).
+		rp.Transport = &http.Transport{
+			ResponseHeaderTimeout: 0, // unbounded: long-lived streams allowed
+			DialContext: (&net.Dialer{
+				Timeout: 5 * time.Second,
+			}).DialContext,
+		}
+		rp.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {

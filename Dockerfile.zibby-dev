@@ -1,0 +1,88 @@
+# syntax=docker/dockerfile:1.7
+#
+# DEV-ONLY Zibby-flavour agent-ops image, built from LOCAL source.
+#
+# Mirrors backend/lib/docker/zibby-agent/Dockerfile (the prod CodeBuild
+# build) but COPYs the working tree instead of `git clone`ing a released
+# tag — so it captures the in-flight 0.4.0 daemon work that isn't yet a
+# GitHub tag. Built multi-arch (linux/amd64 + linux/arm64) via buildx so
+# arm64 Fargate tasks in the DEV apps-fleet can pull it.
+#
+# Build args:
+#   AGENT_OPS_VERSION  — image tag / version stamp (e.g. 0.4.0)
+#   ZIBBY_CLI_VERSION  — @zibby/cli npm version to install
+#
+# This file is dev-only. Prod continues to use the clone-based CodeBuild
+# path against released tags. Do not wire this into the prod pipeline.
+
+ARG AGENT_OPS_VERSION=0.4.0
+ARG ZIBBY_CLI_VERSION=0.6.0
+
+# ─── build stage — go build per-platform via TARGETARCH ──────────────────
+# golang:1.23-alpine is multi-arch on docker hub; buildx sets TARGETARCH
+# per leg. CGO_ENABLED=0 → fully static binary, no libc match needed in
+# the Debian runtime stage.
+FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
+
+ARG AGENT_OPS_VERSION
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /src
+
+# Prime the module cache from go.mod/go.sum first for layer caching, then
+# copy the rest of the working tree.
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+ENV CGO_ENABLED=0
+RUN GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w -X main.version=${AGENT_OPS_VERSION}" \
+    -o /out/agent-opsd ./cmd/agent-opsd \
+ && GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w -X main.version=${AGENT_OPS_VERSION}" \
+    -o /out/agent-ops ./cmd/agent-ops
+
+# ─── runtime stage — Debian (glibc), multi-arch base ─────────────────────
+FROM node:20-bookworm-slim
+
+ARG AGENT_OPS_VERSION
+ARG ZIBBY_CLI_VERSION
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        tzdata \
+        curl \
+        bash \
+        procps \
+        tini \
+ && rm -rf /var/lib/apt/lists/* \
+ && sed -i 's|http://deb.debian.org|https://deb.debian.org|g; s|http://security.debian.org|https://security.debian.org|g' \
+        /etc/apt/sources.list.d/debian.sources \
+ && npm install -g --no-audit --no-fund @anthropic-ai/claude-code \
+ && npm install -g --no-audit --no-fund @openai/codex@0.135.0 \
+ && mkdir -p /var/lib/agent-ops /etc/agent-ops
+
+COPY --from=build /out/agent-opsd /usr/local/bin/agent-opsd
+COPY --from=build /out/agent-ops  /usr/local/bin/agent-ops
+COPY --from=build /src/config.example.yaml /etc/agent-ops/config.yaml
+
+RUN npm install -g --no-audit --no-fund "@zibby/cli@${ZIBBY_CLI_VERSION}" \
+ && zibby --version
+
+ENV SHELL=/bin/bash
+
+USER root
+WORKDIR /root
+
+EXPOSE 7842
+
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:7842/healthz || exit 1
+
+ENTRYPOINT ["/usr/local/bin/agent-opsd"]
+CMD ["--config", "/etc/agent-ops/config.yaml"]

@@ -165,6 +165,14 @@ func (s *Scheduler) makeJob(t state.Task) func() {
 			s.log.Info("scheduler: task disabled, skipping tick", "name", cur.Name)
 			return
 		}
+		// Defensive: when the daemon booted with the scheduler gated off
+		// (no Claude token / agent-ops disabled) the runner is nil and the
+		// cron loop was never Start()ed, so this closure shouldn't fire — but
+		// guard anyway so a stray tick can't nil-panic the daemon.
+		if s.runner == nil {
+			s.log.Info("scheduler: runner not configured (scheduler gated off), skipping tick", "name", cur.Name)
+			return
+		}
 
 		_, _, runErr := s.runner.Run(ctx, task.Spec{
 			Name:    cur.Name,
@@ -237,6 +245,12 @@ func (s *Scheduler) SetTask(ctx context.Context, t state.Task) error {
 // RunNow triggers an immediate ad-hoc run of the named task. Returns the run
 // id once the runner has persisted it. Synchronous — blocks until completion.
 func (s *Scheduler) RunNow(ctx context.Context, taskName, overridePrompt string) (state.TaskRun, error) {
+	// When the scheduler is gated off the daemon has no driver/runner wired
+	// (see daemon.Run). The MCP server is still up, so an operator could call
+	// agent_run_now — fail clearly rather than nil-panic.
+	if s.runner == nil {
+		return state.TaskRun{}, errors.New("scheduler.RunNow: agent-ops scheduler is disabled (no Claude token configured or AGENT_OPS_SCHEDULER_ENABLED=false) — nothing to run")
+	}
 	t, err := s.store.GetTask(ctx, taskName)
 	if err != nil {
 		return state.TaskRun{}, fmt.Errorf("scheduler.RunNow: get task %q: %w", taskName, err)
