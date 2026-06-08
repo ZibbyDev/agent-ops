@@ -206,7 +206,19 @@ const APIPrefix = "/_zibby_ops"
 // panicking.
 func (s *Server) appReverseProxy() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw := strings.TrimSpace(os.Getenv("AGENT_OPS_APP_PORT"))
+		// Front-upstream port: AGENT_OPS_APP_UPSTREAM_PORT overrides the
+		// reverse-proxy target ONLY (not the app's bind port). The Zibby
+		// control plane sets it to the Caddy auth-sidecar port (:8888) when an
+		// app has Basic/Bearer/IP access control enabled, so the chain becomes
+		// ALB → daemon:7842 → Caddy:8888 (auth gate) → app:AGENT_OPS_APP_PORT.
+		// Unset (the common case) → fall back to the app's bind port directly.
+		// We intentionally do NOT key off AGENT_OPS_APP_PORT for the upstream so
+		// bootstrap's readiness poll / port-register / runScript bind keep using
+		// the app's real port.
+		raw := strings.TrimSpace(os.Getenv("AGENT_OPS_APP_UPSTREAM_PORT"))
+		if raw == "" {
+			raw = strings.TrimSpace(os.Getenv("AGENT_OPS_APP_PORT"))
+		}
 		if raw == "" {
 			http.Error(w, "app port not yet known", http.StatusServiceUnavailable)
 			return
