@@ -31,7 +31,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ZibbyHQ/agent-ops/examples"
@@ -200,6 +203,94 @@ func (s *Server) Handler() http.Handler {
 // backend/src/handlers/apps.js.
 const APIPrefix = "/_zibby_ops"
 
+// appEverHealthy flips true the first time the upstream app answers with a
+// non-5xx response (i.e. the app port is genuinely up). Before that — during
+// cold boot, when the app port isn't listening yet — a dial failure surfaces
+// the friendly "starting up" interstitial instead of a raw 502. After the app
+// has answered once we STOP masking, so a genuine later crash shows the real
+// error rather than a misleading "starting up" page.
+var appEverHealthy atomic.Bool
+
+// appReady gates the "starting up" interstitial for apps that come up in
+// stages — e.g. Plane serves its OWN "didn't start up correctly" page (HTTP
+// 200) from its web tier while its API is still booting. A dial-failure check
+// can't catch that (the port IS listening). So when the catalog declares a
+// readiness path (AGENT_OPS_READY_PATH), a background poller hits it until it
+// returns an acceptable status; until then EVERY app request gets the
+// interstitial. Permanent once true.
+var appReady atomic.Bool
+var readyGateOnce sync.Once
+
+// startReadinessGate launches (once) a background poller against the app's
+// readiness path. Sets appReady when it passes. FAIL-OPEN: after a hard
+// deadline it gives up and marks ready anyway, so a mis-configured path can
+// never permanently mask a working app.
+func (s *Server) startReadinessGate(appPort, readyPath string, lo, hi int) {
+	readyGateOnce.Do(func() {
+		go func() {
+			u := "http://127.0.0.1:" + appPort + readyPath
+			client := &http.Client{Timeout: 4 * time.Second}
+			deadline := time.Now().Add(6 * time.Minute)
+			for {
+				resp, err := client.Get(u)
+				if err == nil {
+					code := resp.StatusCode
+					_ = resp.Body.Close()
+					if code >= lo && code <= hi {
+						appReady.Store(true)
+						s.log.Info("readiness gate passed", "path", readyPath, "status", code)
+						return
+					}
+				}
+				if time.Now().After(deadline) {
+					appReady.Store(true) // fail-open
+					s.log.Warn("readiness gate deadline — failing open", "path", readyPath)
+					return
+				}
+				time.Sleep(3 * time.Second)
+			}
+		}()
+	})
+}
+
+// startingUpHTML is the cold-boot interstitial served while the app port isn't
+// listening yet. Self-contained (no external assets) so it renders on the
+// app's own origin with zero dependencies. Matches the dashboard's not-found
+// page look: dark canvas, radial glow, gradient glyph. Auto-refreshes so the
+// real app takes over the moment it's up.
+const startingUpHTML = `<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="4">
+<title>Starting up…</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+  background:#0d0d10;color:#e7e7ea;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  padding:32px 24px;position:relative;overflow:hidden}
+body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:radial-gradient(circle at 50% 40%,rgba(117,83,255,.10) 0%,transparent 55%),
+  radial-gradient(circle at 50% 70%,rgba(255,107,107,.06) 0%,transparent 55%)}
+.card{position:relative;z-index:1;text-align:center;max-width:520px;width:100%}
+.ring{width:84px;height:84px;margin:0 auto 28px;border-radius:50%;
+  background:conic-gradient(from 0deg,#7553FF,#FF6B6B,#FFA94D,#7553FF);
+  -webkit-mask:radial-gradient(farthest-side,transparent calc(100% - 9px),#000 calc(100% - 8px));
+  mask:radial-gradient(farthest-side,transparent calc(100% - 9px),#000 calc(100% - 8px));
+  animation:spin 1.1s linear infinite;filter:drop-shadow(0 0 36px rgba(117,83,255,.35))}
+@keyframes spin{to{transform:rotate(360deg)}}
+h1{font-size:24px;font-weight:600;margin:0 0 12px;letter-spacing:-.01em;
+  background:linear-gradient(135deg,#7553FF 0%,#FF6B6B 50%,#FFA94D 100%);
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+p{font-size:14px;line-height:1.6;color:#9b9ba5;margin:0}
+.dots::after{content:'';animation:dots 1.4s steps(4,end) infinite}
+@keyframes dots{0%{content:''}25%{content:'.'}50%{content:'..'}75%{content:'...'}}
+</style></head>
+<body><div class="card">
+  <div class="ring" aria-hidden="true"></div>
+  <h1>Starting up<span class="dots"></span></h1>
+  <p>Your app is provisioning — this usually takes a minute or two.<br>This page refreshes automatically.</p>
+</div></body></html>`
+
 // appReverseProxy builds the catch-all reverse proxy to the user app port
 // (AGENT_OPS_APP_PORT on 127.0.0.1). When the app port is unknown/unset the
 // handler returns 503 (the app hasn't registered a port yet) rather than
@@ -219,7 +310,35 @@ func (s *Server) appReverseProxy() http.Handler {
 	// (basename mismatch). The app itself doesn't redirect, so we 308 here.
 	trailingSlashPaths := parsePathSet(os.Getenv("AGENT_OPS_TRAILING_SLASH_PATHS"))
 
+	// Optional catalog-driven readiness gate (see appReady). AGENT_OPS_READY_PATH
+	// is a single path that only succeeds once the app is TRULY serving (e.g.
+	// Plane's `/api/instances/` 502s while the API boots, 200s once it's up);
+	// AGENT_OPS_READY_STATUS is the acceptable status or inclusive range
+	// (e.g. "200" or "200-399", default "200-399"). Empty path → no gate (the
+	// dial-failure interstitial still covers the port-not-listening window).
+	readyPath := strings.TrimSpace(os.Getenv("AGENT_OPS_READY_PATH"))
+	readyLo, readyHi := parseStatusRange(os.Getenv("AGENT_OPS_READY_STATUS"))
+	readyAppPort := strings.TrimSpace(os.Getenv("AGENT_OPS_APP_PORT"))
+	if readyPath != "" && readyAppPort != "" {
+		s.startReadinessGate(readyAppPort, readyPath, readyLo, readyHi)
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Readiness gate: while a readiness path is configured and the app
+		// hasn't reported ready yet, serve the friendly auto-refreshing
+		// "starting up" page for browser GETs INSTEAD of proxying (this is what
+		// hides an app's own "not ready" page during staged boot). APIs / non-
+		// HTML clients still get proxied so they see real statuses.
+		if readyPath != "" && !appReady.Load() &&
+			(r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+			strings.Contains(r.Header.Get("Accept"), "text/html") {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Retry-After", "4")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, startingUpHTML)
+			return
+		}
 		// Generic trailing-slash redirect (config-driven; see above). Fire
 		// ONLY when the request path EXACTLY equals a configured path and does
 		// not already end in "/". A sub-path (/foo/bar) or the already-slashed
@@ -267,10 +386,33 @@ func (s *Server) appReverseProxy() http.Handler {
 		// to not buffer. WebSocket upgrades are proxied transparently by
 		// httputil since Go 1.12 (Connection: Upgrade is honored).
 		rp.FlushInterval = -1
-		rp.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, e error) {
-			// Mirror the pre-front behavior: a not-yet-listening app surfaced
-			// as a 502 from the ALB. Keep that semantic here.
+		// Mark the app "ever healthy" the first time it answers with anything
+		// below 5xx — that proves the app port is up. Used by ErrorHandler to
+		// decide between the cold-boot interstitial and a real error.
+		rp.ModifyResponse = func(resp *http.Response) error {
+			if resp.StatusCode < 500 {
+				appEverHealthy.Store(true)
+			}
+			return nil
+		}
+		rp.ErrorHandler = func(w http.ResponseWriter, req *http.Request, e error) {
 			s.log.Warn("app reverse-proxy upstream error", "err", e, "target", target.String())
+			// COLD BOOT: the app port isn't listening yet (dial failure) and the
+			// app has never answered → show the friendly "starting up" page that
+			// auto-refreshes, instead of a raw 502. Skip the interstitial for
+			// non-GET or explicit non-HTML clients (APIs/health probes want the
+			// real status code, not an HTML page). Once the app has been healthy
+			// once, always surface the real 502 (a genuine crash, not a boot).
+			if !appEverHealthy.Load() &&
+				(req.Method == http.MethodGet || req.Method == http.MethodHead) &&
+				strings.Contains(req.Header.Get("Accept"), "text/html") {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.Header().Set("Retry-After", "4")
+				w.Header().Set("Cache-Control", "no-store")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(w, startingUpHTML)
+				return
+			}
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 		}
 		// Tighten the upstream dial so a wedged app fails fast instead of
@@ -283,6 +425,27 @@ func (s *Server) appReverseProxy() http.Handler {
 		}
 		rp.ServeHTTP(w, r)
 	})
+}
+
+// parseStatusRange parses a readiness status spec into an inclusive [lo,hi].
+// "200" → (200,200); "200-399" → (200,399); empty/garbage → (200,399).
+func parseStatusRange(s string) (int, int) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 200, 399
+	}
+	if i := strings.IndexByte(s, '-'); i > 0 {
+		lo, e1 := strconv.Atoi(strings.TrimSpace(s[:i]))
+		hi, e2 := strconv.Atoi(strings.TrimSpace(s[i+1:]))
+		if e1 == nil && e2 == nil && lo > 0 && hi >= lo {
+			return lo, hi
+		}
+		return 200, 399
+	}
+	if n, err := strconv.Atoi(s); err == nil && n > 0 {
+		return n, n
+	}
+	return 200, 399
 }
 
 // parsePathSet turns a comma-separated list of absolute paths
