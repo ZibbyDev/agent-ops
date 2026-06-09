@@ -134,7 +134,18 @@ func MaybeRunFirstRun(
 		// Without this, every container restart left agent-ops idle and
 		// the ALB target group went unhealthy (502 / connection refused).
 		if appIsListening(ctx, cfg) {
-			return nil // app is up — really done, skip
+			// App is already up (durable EFS install + this restart's process)
+			// so the install/bootstrap itself is a genuine no-op. BUT the front
+			// target group is registered out-of-band per TASK IP, and every ECS
+			// task replacement (auth toggle, upgrade, resume, crash, scale)
+			// gives this container a NEW private IP. The marker-skip path used
+			// to `return nil` here WITHOUT re-registering, so the TG stranded on
+			// the dead previous-task IP and the ALB health check failed → 502
+			// for everyone. Re-run the idempotent port-register handshake on
+			// every boot so the control plane re-points the TG at the live IP.
+			// No-op when the Zibby integration env isn't set (OSS standalone).
+			zibby.RegisterPortIfNeeded(ctx, parseMCPPort(cfg.MCP.ListenAddr))
+			return nil // app is up — really done, skip the (re)install
 		}
 		slog.Info("bootstrap: marker exists but app port not listening — re-running script (container restart, app process gone with previous container)",
 			"app_port", os.Getenv("AGENT_OPS_APP_PORT"))
