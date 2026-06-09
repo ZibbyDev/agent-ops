@@ -338,19 +338,27 @@ var validProviders = map[string]bool{
 	"codex":      true,
 	"gemini":     true,
 	"ollama":     true,
+	// "none" = NO LLM agent. The daemon runs the front-proxy, health checks,
+	// register-port and LLM-free (script-mode) installs, but never builds an
+	// LLM driver and idles the scheduler (gated off via
+	// AGENT_OPS_SCHEDULER_ENABLED=false). Used by Zibby "deploy without an
+	// agent" — the app runs, there's just no AI agent and no credential.
+	"none": true,
 }
 
 func (c *Config) validate() error {
 	if !validProviders[c.Agent.Provider] {
-		return fmt.Errorf("config: agent.provider %q is not one of claude|codex|gemini|ollama", c.Agent.Provider)
+		return fmt.Errorf("config: agent.provider %q is not one of none|claude|codex|gemini|ollama", c.Agent.Provider)
 	}
 	if c.Agent.Provider == "claude" && c.Agent.Model == "" {
 		return errors.New("config: agent.model is required when provider=claude")
 	}
 	// claude-cli authenticates via CLAUDE_CODE_OAUTH_TOKEN env (read by the
 	// CLI binary itself), so agent.api_key_env is not meaningful for it.
-	// ollama is fully local. All other cloud providers need an api_key_env.
-	if c.Agent.APIKeyEnv == "" && c.Agent.Provider != "ollama" && c.Agent.Provider != "claude-cli" {
+	// ollama is fully local. "none" runs no LLM at all. All other cloud
+	// providers need an api_key_env.
+	if c.Agent.APIKeyEnv == "" && c.Agent.Provider != "ollama" &&
+		c.Agent.Provider != "claude-cli" && c.Agent.Provider != "none" {
 		return errors.New("config: agent.api_key_env is required for cloud providers")
 	}
 	if c.Agent.MaxToolCallsPerTask < 1 {
