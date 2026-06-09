@@ -289,6 +289,23 @@ func MaybeRunFirstRun(
 	return finalizeBootstrapSuccess(ctx, cfg, marker)
 }
 
+// IsLLMFreeBootstrapMode reports whether the requested bootstrap install
+// path needs NO LLM driver: "script" (catalog deterministic install) and the
+// multi-service noop (also AGENT_OPS_BOOTSTRAP_MODE=script with a noop
+// script). These execute via `bash -c` only — no token, no driver.
+//
+// The daemon uses this to run the install even when the autonomous scheduler
+// is gated off (no agent credential / "deploy WITHOUT an AI agent"). A
+// no-agent app still has to INSTALL; only the ongoing LLM scheduler is off.
+// cheatsheet / agent / agent_script all require the driver, so they are NOT
+// LLM-free and stay gated behind a present credential.
+func IsLLMFreeBootstrapMode() bool {
+	return strings.EqualFold(
+		strings.TrimSpace(os.Getenv("AGENT_OPS_BOOTSTRAP_MODE")),
+		"script",
+	)
+}
+
 // finalizeBootstrapSuccess wires up the port-register handshake (so the ALB
 // can route `<id>.apps.zibby.dev` → the installed app's port) and writes
 // the bootstrap.done marker so subsequent daemon restarts skip re-running.

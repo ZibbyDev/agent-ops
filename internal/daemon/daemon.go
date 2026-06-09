@@ -183,7 +183,20 @@ func Run(cfgPath, version string, logger *slog.Logger) error {
 	// First-run bootstrap — sync; failure exits the daemon. Skipped when the
 	// scheduler is gated off (disabled or no token), same as the scheduled
 	// runs above — a paused / token-less app must not kick off agent work.
-	if schedOn {
+	//
+	// EXCEPTION: LLM-free installs (AGENT_OPS_BOOTSTRAP_MODE=script — catalog
+	// deterministic installs + multi-service noop) run EVEN when the scheduler
+	// is gated off. This is the "deploy a managed app WITHOUT an AI agent"
+	// path: no agent credential is injected, so schedulerGate idles the
+	// autonomous scheduler, but the app still has to INSTALL. Script-mode
+	// bootstrap is `bash -c` only (runScriptBootstrap) — it never constructs
+	// the driver, so it's safe to run token-less. cheatsheet / agent /
+	// agent_script DO need the driver and stay gated behind a credential.
+	runInstall := schedOn || bootstrap.IsLLMFreeBootstrapMode()
+	if runInstall {
+		if !schedOn {
+			logger.Info("first-run bootstrap running despite idle scheduler (LLM-free script mode — no-agent deploy)")
+		}
 		if err := bootstrap.MaybeRunFirstRun(ctx, cfg, sched, store); err != nil {
 			return fmt.Errorf("bootstrap: %w", err)
 		}
