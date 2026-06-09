@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -572,5 +573,121 @@ func TestOrigin_EnvOverride(t *testing.T) {
 	// Default origin no longer allowed (env replaces defaults)
 	if status, _ := originPost(t, httpSrv.URL, "https://zibby.dev"); status != http.StatusForbidden {
 		t.Fatalf("default origin should be rejected when env override is set: status=%d", status)
+	}
+}
+
+// ─── Generic config-driven trailing-slash redirect ─────────────────────────
+
+// trailingSlashSetup spins up: (1) a fake upstream "app" that echoes its
+// request path with 200, and (2) an MCP Server whose catch-all reverse proxy
+// points at that upstream (via AGENT_OPS_APP_PORT) with the given
+// AGENT_OPS_TRAILING_SLASH_PATHS env. Returns a non-redirect-following client
+// + the front URL so callers can observe the 308 directly.
+func trailingSlashSetup(t *testing.T, slashPaths string) (*http.Client, string) {
+	t.Helper()
+
+	// Fake upstream app — replies 200 with the path it received so "proxied"
+	// cases are distinguishable from a redirect.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("UPSTREAM:" + r.URL.Path))
+	}))
+	t.Cleanup(upstream.Close)
+	// httptest URL is http://127.0.0.1:PORT — extract the port for the proxy.
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(upstream.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split upstream host: %v", err)
+	}
+	t.Setenv("AGENT_OPS_APP_PORT", port)
+	if slashPaths != "" {
+		t.Setenv("AGENT_OPS_TRAILING_SLASH_PATHS", slashPaths)
+	}
+
+	st, err := state.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	tools := tool.NewRegistry()
+	_ = tools.Register(tool.NewShellTool())
+	runner := task.NewRunner(fakeDriver{}, tools, st)
+	sched := scheduler.New(runner, st, slog.Default())
+	sched.Start()
+	t.Cleanup(func() { _ = sched.Stop(context.Background()) })
+
+	mcpSrv, err := New(Config{Scheduler: sched, Store: st, Tools: tools, Token: "test-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	front := httptest.NewServer(mcpSrv.Handler())
+	t.Cleanup(front.Close)
+
+	// Do NOT follow redirects — we want to assert on the 308 itself.
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	return client, front.URL
+}
+
+func TestTrailingSlashRedirect_BarePathRedirects(t *testing.T) {
+	client, base := trailingSlashSetup(t, "/god-mode,/spaces")
+	resp, err := client.Get(base + "/god-mode?foo=bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPermanentRedirect {
+		t.Fatalf("bare path: expected 308, got %d", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/god-mode/?foo=bar" {
+		t.Fatalf("bare path: expected Location=/god-mode/?foo=bar, got %q", loc)
+	}
+}
+
+func TestTrailingSlashRedirect_TrailingSlashNotRedirected(t *testing.T) {
+	client, base := trailingSlashSetup(t, "/god-mode,/spaces")
+	resp, err := client.Get(base + "/god-mode/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("already-slashed path should be proxied (200), got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "UPSTREAM:/god-mode/" {
+		t.Fatalf("already-slashed path should reach upstream, got %q", string(body))
+	}
+}
+
+func TestTrailingSlashRedirect_SubPathNotRedirected(t *testing.T) {
+	client, base := trailingSlashSetup(t, "/god-mode,/spaces")
+	resp, err := client.Get(base + "/god-mode/foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sub-path should be proxied (200), got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "UPSTREAM:/god-mode/foo" {
+		t.Fatalf("sub-path should reach upstream, got %q", string(body))
+	}
+}
+
+func TestTrailingSlashRedirect_UnsetEnvNoRedirect(t *testing.T) {
+	client, base := trailingSlashSetup(t, "") // env unset → feature off
+	resp, err := client.Get(base + "/god-mode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unset env: bare path should be proxied (200), got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "UPSTREAM:/god-mode" {
+		t.Fatalf("unset env: bare path should reach upstream, got %q", string(body))
 	}
 }

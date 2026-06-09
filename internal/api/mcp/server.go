@@ -205,7 +205,40 @@ const APIPrefix = "/_zibby_ops"
 // handler returns 503 (the app hasn't registered a port yet) rather than
 // panicking.
 func (s *Server) appReverseProxy() http.Handler {
+	// Parse the configured trailing-slash redirect paths ONCE at handler
+	// construction (Handler() is called once per Server). This is a GENERIC,
+	// config-driven capability: the exact paths come from the per-app catalog
+	// (backend splices catalog.trailingSlashRedirects → this env var). NO app
+	// name is ever hardcoded here — agent-ops only knows "redirect these bare
+	// paths to their trailing-slash form". Unset/empty → no redirects (the
+	// default, behavior-preserving case).
+	//
+	// Why this exists: some apps serve a single-page app under a subpath whose
+	// client-side router uses a basename WITH a trailing slash. Landing on the
+	// bare path (no slash) loads the page but hangs client-side navigation
+	// (basename mismatch). The app itself doesn't redirect, so we 308 here.
+	trailingSlashPaths := parsePathSet(os.Getenv("AGENT_OPS_TRAILING_SLASH_PATHS"))
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Generic trailing-slash redirect (config-driven; see above). Fire
+		// ONLY when the request path EXACTLY equals a configured path and does
+		// not already end in "/". A sub-path (/foo/bar) or the already-slashed
+		// form (/foo/) passes straight through to the proxy. 308 preserves the
+		// request method + body for all verbs (only GET/HEAD realistically hit
+		// this, but 308 is safe regardless).
+		if len(trailingSlashPaths) > 0 {
+			p := r.URL.Path
+			if !strings.HasSuffix(p, "/") && trailingSlashPaths[p] {
+				loc := p + "/"
+				if r.URL.RawQuery != "" {
+					loc += "?" + r.URL.RawQuery
+				}
+				w.Header().Set("Location", loc)
+				w.WriteHeader(http.StatusPermanentRedirect)
+				return
+			}
+		}
+
 		// Front-upstream port: AGENT_OPS_APP_UPSTREAM_PORT overrides the
 		// reverse-proxy target ONLY (not the app's bind port). The Zibby
 		// control plane sets it to the Caddy auth-sidecar port (:8888) when an
@@ -250,6 +283,26 @@ func (s *Server) appReverseProxy() http.Handler {
 		}
 		rp.ServeHTTP(w, r)
 	})
+}
+
+// parsePathSet turns a comma-separated list of absolute paths
+// (e.g. "/foo,/bar") into a lookup set. Entries are trimmed; blank
+// entries are skipped. Returns a nil/empty map for empty input so callers can
+// cheaply skip the feature. GENERIC: the actual paths are supplied per-app via
+// the catalog — this function knows nothing about any specific app.
+func parsePathSet(csv string) map[string]bool {
+	csv = strings.TrimSpace(csv)
+	if csv == "" {
+		return nil
+	}
+	out := make(map[string]bool)
+	for _, p := range strings.Split(csv, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out[p] = true
+		}
+	}
+	return out
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
