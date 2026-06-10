@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -689,5 +690,120 @@ func TestTrailingSlashRedirect_UnsetEnvNoRedirect(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "UPSTREAM:/god-mode" {
 		t.Fatalf("unset env: bare path should reach upstream, got %q", string(body))
+	}
+}
+
+// ─── OpenHands agent-server bridge (/_oh_agent/<PORT>/…) ────────────────────
+
+// ohAgentFront spins up a bare MCP Server (no app port set — the oh-agent route
+// is independent of AGENT_OPS_APP_PORT) and returns its front URL + a
+// non-redirect-following client.
+func ohAgentFront(t *testing.T) (*http.Client, string) {
+	t.Helper()
+	st, err := state.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	tools := tool.NewRegistry()
+	_ = tools.Register(tool.NewShellTool())
+	runner := task.NewRunner(fakeDriver{}, tools, st)
+	sched := scheduler.New(runner, st, slog.Default())
+	sched.Start()
+	t.Cleanup(func() { _ = sched.Stop(context.Background()) })
+
+	mcpSrv, err := New(Config{Scheduler: sched, Store: st, Tools: tools, Token: "test-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	front := httptest.NewServer(mcpSrv.Handler())
+	t.Cleanup(front.Close)
+
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	return client, front.URL
+}
+
+// TestOhAgentProxy_StripsPrefixAndProxies binds a fake agent server on a port in
+// the allowlist range and asserts /_oh_agent/<PORT>/<rest> reaches it with the
+// /_oh_agent/<PORT> prefix stripped and the query string preserved.
+func TestOhAgentProxy_StripsPrefixAndProxies(t *testing.T) {
+	// Grab a free port inside [8000,8099]; skip if the whole range is taken.
+	var ln net.Listener
+	var port int
+	for p := ohAgentPortLo; p <= ohAgentPortHi; p++ {
+		l, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(p))
+		if err == nil {
+			ln, port = l, p
+			break
+		}
+	}
+	if ln == nil {
+		t.Skip("no free port in oh-agent allowlist range")
+	}
+	upstream := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "OHAGENT:"+r.URL.Path+"?"+r.URL.RawQuery)
+	})}
+	go func() { _ = upstream.Serve(ln) }()
+	t.Cleanup(func() { _ = upstream.Close() })
+
+	client, base := ohAgentFront(t)
+	resp, err := client.Get(base + "/_oh_agent/" + strconv.Itoa(port) + "/socket/io?foo=bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "OHAGENT:/socket/io?foo=bar" {
+		t.Fatalf("prefix-strip/query: got %q, want OHAGENT:/socket/io?foo=bar", string(body))
+	}
+}
+
+// TestOhAgentProxy_RejectsPortOutOfRange asserts ports outside [8000,8099] (and
+// non-numeric segments) are rejected with 400 — the SSRF guard — before any
+// dial happens.
+func TestOhAgentProxy_RejectsPortOutOfRange(t *testing.T) {
+	client, base := ohAgentFront(t)
+	for _, bad := range []string{"7999", "8100", "22", "0", "notaport"} {
+		resp, err := client.Get(base + "/_oh_agent/" + bad + "/x")
+		if err != nil {
+			t.Fatalf("port %s: %v", bad, err)
+		}
+		got := resp.StatusCode
+		_ = resp.Body.Close()
+		if got != http.StatusBadRequest {
+			t.Fatalf("port %s: expected 400, got %d", bad, got)
+		}
+	}
+}
+
+// TestOhAgentProxy_DeadPort502 asserts an in-range but not-listening port
+// surfaces a 502 (proxy ErrorHandler) rather than crashing the daemon.
+func TestOhAgentProxy_DeadPort502(t *testing.T) {
+	// Find an in-range port that's NOT listening.
+	port := 0
+	for p := ohAgentPortHi; p >= ohAgentPortLo; p-- {
+		l, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(p))
+		if err == nil {
+			_ = l.Close() // closed → nothing listening there now
+			port = p
+			break
+		}
+	}
+	if port == 0 {
+		t.Skip("no bindable port in oh-agent allowlist range")
+	}
+	client, base := ohAgentFront(t)
+	resp, err := client.Get(base + "/_oh_agent/" + strconv.Itoa(port) + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("dead port: expected 502, got %d", resp.StatusCode)
 	}
 }

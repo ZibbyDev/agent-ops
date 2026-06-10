@@ -200,6 +200,17 @@ func (s *Server) Handler() http.Handler {
 	// that hit the daemon directly (no ALB prefix) keep working.
 	mux.HandleFunc("/mcp", s.handleMCP)
 
+	// OpenHands agent-server bridge. OpenHands (the user app) spawns a fresh
+	// "agent server" subprocess per conversation on a dynamic localhost port in
+	// 8000..8099, and the browser must reach it through the public domain. This
+	// route reverse-proxies /_oh_agent/<PORT>/<rest> → http://127.0.0.1:<PORT>/<rest>
+	// (HTTP + WebSocket), stripping the /_oh_agent/<PORT> prefix. It is NOT gated
+	// by appauth: the agent server enforces its own session-api-key auth, so
+	// double-auth here would just break the browser. The PORT allowlist (see
+	// ohAgentProxy) is the SSRF guard that stops this reaching arbitrary local
+	// ports.
+	mux.HandleFunc("/_oh_agent/", s.ohAgentProxy())
+
 	// Catch-all: reverse-proxy every non-ops path to the user app port.
 	mux.Handle("/", s.appReverseProxy())
 	return mux
@@ -209,6 +220,18 @@ func (s *Server) Handler() http.Handler {
 // (ops) traffic under. Must stay in sync with APPS_DAEMON_OPS_PATH_PREFIX in
 // backend/src/handlers/apps.js.
 const APIPrefix = "/_zibby_ops"
+
+// ohAgentPrefix and the [ohAgentPortLo, ohAgentPortHi] allowlist bound the
+// OpenHands agent-server bridge (see ohAgentProxy). OpenHands spawns its
+// per-conversation agent servers on dynamic localhost ports in this range;
+// restricting the proxy to it is the SSRF guard that keeps a crafted URL from
+// reaching arbitrary in-container ports (e.g. the daemon itself, or a secrets
+// sidecar).
+const (
+	ohAgentPrefix = "/_oh_agent/"
+	ohAgentPortLo = 8000
+	ohAgentPortHi = 8099
+)
 
 // appEverHealthy flips true the first time the upstream app answers with a
 // non-5xx response (i.e. the app port is genuinely up). Before that — during
@@ -445,6 +468,68 @@ func (s *Server) appReverseProxy() http.Handler {
 		}
 		rp.ServeHTTP(w, r)
 	})
+}
+
+// ohAgentProxy reverse-proxies /_oh_agent/<PORT>/<rest...> to
+// http://127.0.0.1:<PORT>/<rest...> inside the container — the bridge that lets
+// a remote browser reach the per-conversation OpenHands "agent server"
+// subprocess (HTTP + WebSocket) through the public domain. The /_oh_agent/<PORT>
+// prefix is stripped; the query string is preserved.
+//
+// PORT must be an integer in [ohAgentPortLo, ohAgentPortHi]; anything else is
+// rejected with 400 (this is the SSRF guard — see the const block). The route
+// is deliberately NOT behind appauth: the agent server enforces its own
+// session-api-key auth, and gating here would double-auth and break the
+// browser. If the target port isn't listening the proxy's ErrorHandler returns
+// 502 rather than crashing.
+func (s *Server) ohAgentProxy() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Path is "/_oh_agent/<PORT>/<rest...>". Strip the prefix, then split
+		// the first segment (the port) from the remainder (the proxied path).
+		rest := strings.TrimPrefix(r.URL.Path, ohAgentPrefix)
+		portStr, tail, _ := strings.Cut(rest, "/")
+
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port < ohAgentPortLo || port > ohAgentPortHi {
+			http.Error(w, "oh-agent: port out of allowed range", http.StatusBadRequest)
+			return
+		}
+
+		target, err := url.Parse("http://127.0.0.1:" + portStr)
+		if err != nil {
+			http.Error(w, "oh-agent: bad target", http.StatusBadGateway)
+			return
+		}
+
+		rp := httputil.NewSingleHostReverseProxy(target)
+		// Custom Director: NewSingleHostReverseProxy would join the inbound path
+		// onto target.Path; we instead REPLACE it with the stripped "/<rest...>"
+		// so /_oh_agent/<PORT> is gone from the upstream request. Query string is
+		// carried verbatim. Host/scheme point at the loopback target. The std
+		// proxy already preserves Upgrade/Connection headers, so WebSocket
+		// upgrades pass through untouched (no hop-by-hop stripping here).
+		rp.Director = func(req *http.Request) {
+			req.URL.Scheme = target.Scheme
+			req.URL.Host = target.Host
+			req.Host = target.Host
+			req.URL.Path = "/" + tail
+			// RawQuery is left as-is — it survives the rewrite above.
+		}
+		// FlushInterval < 0 flushes immediately so SSE/streaming responses from
+		// the agent server aren't buffered, and so WebSocket frames flow live.
+		rp.FlushInterval = -1
+		rp.ErrorHandler = func(w http.ResponseWriter, req *http.Request, e error) {
+			s.log.Warn("oh-agent reverse-proxy upstream error", "err", e, "target", target.String())
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		}
+		// Fail fast on a dead port instead of hanging the front.
+		rp.Transport = &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout: 5 * time.Second,
+			}).DialContext,
+		}
+		rp.ServeHTTP(w, r)
+	}
 }
 
 // parseStatusRange parses a readiness status spec into an inclusive [lo,hi].
