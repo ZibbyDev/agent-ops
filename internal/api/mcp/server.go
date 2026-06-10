@@ -37,6 +37,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ZibbyHQ/agent-ops/internal/appauth"
+
 	"github.com/ZibbyHQ/agent-ops/examples"
 	"github.com/ZibbyHQ/agent-ops/internal/scheduler"
 	"github.com/ZibbyHQ/agent-ops/internal/state"
@@ -184,6 +186,11 @@ func (s *Server) Handler() http.Handler {
 	// legacy ops target group, which health-checked /healthz directly.
 	mux.HandleFunc(APIPrefix+"/healthz", s.handleHealth)
 	mux.HandleFunc("/healthz", s.handleHealth)
+
+	// Hot-swap the app access-control config (Basic / IP allowlist / token).
+	// The control plane POSTs here when the user changes auth, so it applies
+	// with no task restart. Bridge-token authed (handleSetAuth checks authOK).
+	mux.HandleFunc(APIPrefix+"/auth", s.handleSetAuth)
 
 	// MCP under the prefix the control plane actually calls. ALB `forward`
 	// actions do not strip path prefixes, so the daemon must serve the full
@@ -358,19 +365,32 @@ func (s *Server) appReverseProxy() http.Handler {
 			}
 		}
 
-		// Front-upstream port: AGENT_OPS_APP_UPSTREAM_PORT overrides the
-		// reverse-proxy target ONLY (not the app's bind port). The Zibby
-		// control plane sets it to the Caddy auth-sidecar port (:8888) when an
-		// app has Basic/Bearer/IP access control enabled, so the chain becomes
-		// ALB → daemon:7842 → Caddy:8888 (auth gate) → app:AGENT_OPS_APP_PORT.
-		// Unset (the common case) → fall back to the app's bind port directly.
-		// We intentionally do NOT key off AGENT_OPS_APP_PORT for the upstream so
-		// bootstrap's readiness poll / port-register / runScript bind keep using
-		// the app's real port.
-		raw := strings.TrimSpace(os.Getenv("AGENT_OPS_APP_UPSTREAM_PORT"))
-		if raw == "" {
-			raw = strings.TrimSpace(os.Getenv("AGENT_OPS_APP_PORT"))
+		// ACCESS CONTROL (Basic auth / IP allowlist / bearer token) — enforced
+		// HERE, in the always-on daemon, so the control plane can change it with
+		// ZERO task restart (config is hot-swapped via the register-port boot
+		// response + POST /_zibby_ops/auth). This REPLACES the old Caddy auth
+		// sidecar. Ops + health paths (/_zibby_ops/*, /healthz, /mcp) are
+		// separate mux entries and never reach this handler, so they're
+		// inherently exempt — the ALB health check is never gated. A nil config
+		// (the default) is passthrough.
+		if ac := appauth.Load(); ac != nil {
+			if ok, status, wwwAuth := ac.Enforce(r); !ok {
+				if wwwAuth != "" {
+					w.Header().Set("WWW-Authenticate", wwwAuth)
+				}
+				w.WriteHeader(status)
+				return
+			}
 		}
+
+		// Reverse-proxy straight to the app's bind port. The daemon now enforces
+		// access control itself (appauth, above), so we ALWAYS go direct to the
+		// app — no Caddy auth-sidecar hop. AGENT_OPS_APP_UPSTREAM_PORT (the old
+		// caddy:8888 override) is intentionally ignored: on a legacy instance
+		// that still has the Caddy sidecar + that env, going direct BYPASSES the
+		// now-stale sidecar so its env-pinned (un-hot-reloadable) rules can't
+		// fight the daemon's live config. The sidecar is dropped on next deploy.
+		raw := strings.TrimSpace(os.Getenv("AGENT_OPS_APP_PORT"))
 		if raw == "" {
 			http.Error(w, "app port not yet known", http.StatusServiceUnavailable)
 			return
@@ -471,6 +491,35 @@ func parsePathSet(csv string) map[string]bool {
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+// handleSetAuth hot-swaps the app access-control config. POST + bridge-token
+// authed (same AGENT_OPS_TOKEN the MCP/ops endpoints require). The body is the
+// appauth wire JSON ({basic,token,ipAllowList}); an empty/null body clears all
+// gates. Returns 204 on success. NEVER restarts anything — the swap is atomic
+// and applies to the very next proxied request.
+func (s *Server) handleSetAuth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.authOK(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	if err != nil {
+		http.Error(w, "read error", http.StatusBadRequest)
+		return
+	}
+	if err := appauth.Apply(body); err != nil {
+		s.log.Warn("set-auth: bad config", "err", err.Error())
+		http.Error(w, "bad config", http.StatusBadRequest)
+		return
+	}
+	s.log.Info("set-auth: access-control config applied (hot, no restart)")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {

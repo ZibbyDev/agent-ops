@@ -23,6 +23,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ZibbyHQ/agent-ops/internal/appauth"
 )
 
 // RegisterPortIfNeeded picks the app's port and POSTs it to Zibby. Priority:
@@ -81,6 +83,22 @@ func RegisterPortIfNeeded(ctx context.Context, mcpPort int) {
 		return
 	}
 	slog.Info("zibby: register-port ok", "status", resp.StatusCode, "port", port)
+
+	// Apply the access-control config the control plane returns on every boot.
+	// This is how auth (Basic / IP allowlist / token) survives a task restart
+	// WITHOUT being baked into the task definition — the daemon enforces it
+	// in-process (internal/appauth); live changes arrive via POST
+	// /_zibby_ops/auth. Absent/null `auth` → no gate (passthrough).
+	var rr struct {
+		Auth json.RawMessage `json:"auth"`
+	}
+	if json.Unmarshal(rb, &rr) == nil && len(rr.Auth) > 0 && string(rr.Auth) != "null" {
+		if err := appauth.Apply(rr.Auth); err != nil {
+			slog.Warn("zibby: apply access-control from register-port failed", "err", err.Error())
+		} else {
+			slog.Info("zibby: applied access-control from register-port")
+		}
+	}
 }
 
 // resolveAppPort returns the port to hand to Zibby. AGENT_OPS_APP_PORT wins
