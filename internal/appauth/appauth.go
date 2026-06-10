@@ -95,6 +95,15 @@ func Apply(raw []byte) error {
 			}
 		}
 		if _, n, err := net.ParseCIDR(s); err == nil {
+			// Defensive: drop private / loopback / link-local / unspecified
+			// CIDRs. The allowlist gates PUBLIC clients behind the ALB, and
+			// RealClientIP returns the real public client IP — a private CIDR
+			// could never match a legitimate client and (via the all-private
+			// XFF fallback) could be abused by a VPC-internal origin. The
+			// backend rejects these at the API; this is belt-and-braces.
+			if ip := n.IP; ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+				continue
+			}
 			c.ipNets = append(c.ipNets, n)
 		}
 	}

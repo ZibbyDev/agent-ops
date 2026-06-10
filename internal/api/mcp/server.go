@@ -331,6 +331,24 @@ func (s *Server) appReverseProxy() http.Handler {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// ACCESS CONTROL FIRST — before the readiness interstitial and the
+		// trailing-slash redirect, so a gated app returns 401/403 UNIFORMLY for
+		// every path and leaks nothing pre-auth (not even the "starting up" page
+		// or a reflected redirect Location). Ops/health/mcp are separate mux
+		// entries and never reach here, so the ALB health check stays exempt. A
+		// nil config (the default) is passthrough. Enforced in the always-on
+		// daemon so the control plane changes it with ZERO task restart (config
+		// hot-swapped via the register-port boot response + POST /_zibby_ops/auth).
+		if ac := appauth.Load(); ac != nil {
+			if ok, status, wwwAuth := ac.Enforce(r); !ok {
+				if wwwAuth != "" {
+					w.Header().Set("WWW-Authenticate", wwwAuth)
+				}
+				w.WriteHeader(status)
+				return
+			}
+		}
+
 		// Readiness gate: while a readiness path is configured and the app
 		// hasn't reported ready yet, serve the friendly auto-refreshing
 		// "starting up" page for browser GETs INSTEAD of proxying (this is what
@@ -361,24 +379,6 @@ func (s *Server) appReverseProxy() http.Handler {
 				}
 				w.Header().Set("Location", loc)
 				w.WriteHeader(http.StatusPermanentRedirect)
-				return
-			}
-		}
-
-		// ACCESS CONTROL (Basic auth / IP allowlist / bearer token) — enforced
-		// HERE, in the always-on daemon, so the control plane can change it with
-		// ZERO task restart (config is hot-swapped via the register-port boot
-		// response + POST /_zibby_ops/auth). This REPLACES the old Caddy auth
-		// sidecar. Ops + health paths (/_zibby_ops/*, /healthz, /mcp) are
-		// separate mux entries and never reach this handler, so they're
-		// inherently exempt — the ALB health check is never gated. A nil config
-		// (the default) is passthrough.
-		if ac := appauth.Load(); ac != nil {
-			if ok, status, wwwAuth := ac.Enforce(r); !ok {
-				if wwwAuth != "" {
-					w.Header().Set("WWW-Authenticate", wwwAuth)
-				}
-				w.WriteHeader(status)
 				return
 			}
 		}
