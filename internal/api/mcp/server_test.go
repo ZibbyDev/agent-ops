@@ -807,3 +807,93 @@ func TestOhAgentProxy_DeadPort502(t *testing.T) {
 		t.Fatalf("dead port: expected 502, got %d", resp.StatusCode)
 	}
 }
+
+// ─── openvscode-server sub-path bridge (/_ohvs/<PORT>/…) ────────────────────
+
+// TestOhvsProxy_PreservesPrefix binds a fake server on a port in the allowlist
+// range and asserts /_ohvs/<PORT>/<rest> reaches it with the FULL prefixed path
+// intact — i.e. /_ohvs/<PORT>/foo is forwarded UNCHANGED (NOT stripped), which
+// is the whole point: openvscode-server runs with --server-base-path
+// /_ohvs/<PORT>. The query string is preserved too. The ohAgentFront helper
+// gives an MCP front whose mux includes the /_ohvs/ route.
+func TestOhvsProxy_PreservesPrefix(t *testing.T) {
+	// Grab a free port inside [8000,8099]; skip if the whole range is taken.
+	var ln net.Listener
+	var port int
+	for p := ohAgentPortLo; p <= ohAgentPortHi; p++ {
+		l, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(p))
+		if err == nil {
+			ln, port = l, p
+			break
+		}
+	}
+	if ln == nil {
+		t.Skip("no free port in ohvs allowlist range")
+	}
+	upstream := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "OHVS:"+r.URL.Path+"?"+r.URL.RawQuery)
+	})}
+	go func() { _ = upstream.Serve(ln) }()
+	t.Cleanup(func() { _ = upstream.Close() })
+
+	client, base := ohAgentFront(t)
+	full := "/_ohvs/" + strconv.Itoa(port) + "/foo"
+	resp, err := client.Get(base + full + "?baz=qux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	want := "OHVS:" + full + "?baz=qux"
+	if string(body) != want {
+		t.Fatalf("prefix must be PRESERVED (not stripped): got %q, want %q", string(body), want)
+	}
+}
+
+// TestOhvsProxy_RejectsPortOutOfRange asserts ports outside [8000,8099] (and
+// non-numeric segments) are rejected with 400 — the same SSRF guard as the
+// agent bridge — before any dial happens.
+func TestOhvsProxy_RejectsPortOutOfRange(t *testing.T) {
+	client, base := ohAgentFront(t)
+	for _, bad := range []string{"7999", "8100", "22", "0", "notaport"} {
+		resp, err := client.Get(base + "/_ohvs/" + bad + "/x")
+		if err != nil {
+			t.Fatalf("port %s: %v", bad, err)
+		}
+		got := resp.StatusCode
+		_ = resp.Body.Close()
+		if got != http.StatusBadRequest {
+			t.Fatalf("port %s: expected 400, got %d", bad, got)
+		}
+	}
+}
+
+// TestOhvsProxy_DeadPort502 asserts an in-range but not-listening port surfaces
+// a 502 (proxy ErrorHandler) rather than crashing the daemon.
+func TestOhvsProxy_DeadPort502(t *testing.T) {
+	// Find an in-range port that's NOT listening.
+	port := 0
+	for p := ohAgentPortHi; p >= ohAgentPortLo; p-- {
+		l, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(p))
+		if err == nil {
+			_ = l.Close() // closed → nothing listening there now
+			port = p
+			break
+		}
+	}
+	if port == 0 {
+		t.Skip("no bindable port in ohvs allowlist range")
+	}
+	client, base := ohAgentFront(t)
+	resp, err := client.Get(base + "/_ohvs/" + strconv.Itoa(port) + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("dead port: expected 502, got %d", resp.StatusCode)
+	}
+}

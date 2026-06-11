@@ -211,6 +211,15 @@ func (s *Server) Handler() http.Handler {
 	// ports.
 	mux.HandleFunc("/_oh_agent/", s.ohAgentProxy())
 
+	// openvscode-server sub-path bridge — prefix preserved (NOT stripped)
+	// because openvscode runs with --server-base-path /_ohvs/<port>. Unlike the
+	// agent server (which serves at /), openvscode-server emits its redirects and
+	// asset URLs UNDER that base path, so it expects the full /_ohvs/<PORT>/<rest>
+	// to arrive intact; stripping the prefix would break it. Same
+	// [ohAgentPortLo, ohAgentPortHi] SSRF allowlist and same NOT-appauth-gated
+	// treatment as /_oh_agent/. Purely additive: no other app uses /_ohvs/.
+	mux.HandleFunc(ohvsPrefix, s.ohvsProxy())
+
 	// Catch-all: reverse-proxy every non-ops path to the user app port.
 	mux.Handle("/", s.appReverseProxy())
 	return mux
@@ -232,6 +241,13 @@ const (
 	ohAgentPortLo = 8000
 	ohAgentPortHi = 8099
 )
+
+// ohvsPrefix bounds the openvscode-server sub-path bridge (see ohvsProxy). It
+// reuses the SAME [ohAgentPortLo, ohAgentPortHi] port allowlist as the agent
+// bridge, but — unlike ohAgentProxy — it preserves the full /_ohvs/<PORT>/…
+// path because openvscode-server is launched with --server-base-path
+// /_ohvs/<PORT> and emits its redirects/assets under that base path.
+const ohvsPrefix = "/_ohvs/"
 
 // appEverHealthy flips true the first time the upstream app answers with a
 // non-5xx response (i.e. the app port is genuinely up). Before that — during
@@ -520,6 +536,73 @@ func (s *Server) ohAgentProxy() http.HandlerFunc {
 		rp.FlushInterval = -1
 		rp.ErrorHandler = func(w http.ResponseWriter, req *http.Request, e error) {
 			s.log.Warn("oh-agent reverse-proxy upstream error", "err", e, "target", target.String())
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		}
+		// Fail fast on a dead port instead of hanging the front.
+		rp.Transport = &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout: 5 * time.Second,
+			}).DialContext,
+		}
+		rp.ServeHTTP(w, r)
+	}
+}
+
+// ohvsProxy reverse-proxies /_ohvs/<PORT>/<rest...> to http://127.0.0.1:<PORT>
+// inside the container — the bridge that lets a remote browser reach an
+// in-container openvscode-server (the web IDE) through the public domain.
+//
+// Crucially, and UNLIKE ohAgentProxy, the /_ohvs/<PORT> prefix is PRESERVED
+// (NOT stripped): openvscode-server is launched with
+// --server-base-path /_ohvs/<PORT>, so it expects the full prefixed path and
+// emits its redirects/asset URLs under /_ohvs/<PORT>/…. Stripping the prefix
+// would break every redirect and asset load. The query string is preserved
+// too, and WebSocket upgrades pass through (the IDE's terminal/LSP channels).
+//
+// PORT must be an integer in [ohAgentPortLo, ohAgentPortHi] — the SAME
+// allowlist as the agent bridge; anything else is rejected with 400 (the SSRF
+// guard). Like /_oh_agent/ and /healthz this route is deliberately NOT behind
+// appauth. If the target port isn't listening the proxy's ErrorHandler returns
+// 502 rather than crashing.
+func (s *Server) ohvsProxy() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Path is "/_ohvs/<PORT>/<rest...>". Strip the prefix only to read the
+		// first segment (the port) for validation — the upstream request keeps
+		// the ORIGINAL r.URL.Path verbatim (see the Director below).
+		rest := strings.TrimPrefix(r.URL.Path, ohvsPrefix)
+		portStr, _, _ := strings.Cut(rest, "/")
+
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port < ohAgentPortLo || port > ohAgentPortHi {
+			http.Error(w, "ohvs: port out of allowed range", http.StatusBadRequest)
+			return
+		}
+
+		target, err := url.Parse("http://127.0.0.1:" + portStr)
+		if err != nil {
+			http.Error(w, "ohvs: bad target", http.StatusBadGateway)
+			return
+		}
+
+		rp := httputil.NewSingleHostReverseProxy(target)
+		// Custom Director that does NOT touch the path. NewSingleHostReverseProxy
+		// would join target.Path (empty) onto the inbound path, which is a no-op
+		// here — but we set it explicitly to make the no-strip contract obvious:
+		// the full /_ohvs/<PORT>/<rest...> is forwarded UNCHANGED, because
+		// openvscode-server runs with --server-base-path /_ohvs/<PORT> and serves
+		// from that base. Only scheme/Host are pointed at the loopback target;
+		// RawQuery is left as-is. The std proxy preserves Upgrade/Connection
+		// headers, so WebSocket upgrades pass through untouched.
+		origDirector := rp.Director
+		rp.Director = func(req *http.Request) {
+			origDirector(req) // sets scheme/Host + preserves the path & query
+			req.Host = target.Host
+		}
+		// FlushInterval < 0 flushes immediately so streaming responses aren't
+		// buffered and WebSocket frames flow live.
+		rp.FlushInterval = -1
+		rp.ErrorHandler = func(w http.ResponseWriter, req *http.Request, e error) {
+			s.log.Warn("ohvs reverse-proxy upstream error", "err", e, "target", target.String())
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 		}
 		// Fail fast on a dead port instead of hanging the front.
