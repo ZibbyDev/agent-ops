@@ -1,7 +1,7 @@
 # homebrew-tap (stub layout)
 
 This directory is the **template** for the
-[`ZibbyHQ/homebrew-tap`](https://github.com/ZibbyHQ/homebrew-tap) GitHub repo
+[`ZibbyDev/homebrew-tap`](https://github.com/ZibbyDev/homebrew-tap) GitHub repo
 that goreleaser PRs into on every release.
 
 The operator creates the actual GitHub repo manually (the release subagent
@@ -21,10 +21,10 @@ homebrew-tap/
 
 ## Operator setup steps (one-time)
 
-1. `gh repo create ZibbyHQ/homebrew-tap --public --description "Homebrew tap for ZibbyHQ tools"`
+1. `gh repo create ZibbyDev/homebrew-tap --public --description "Homebrew tap for ZibbyDev tools"`
 2. Copy `README.md` + `Casks/agent-ops.rb` from this directory into the new repo.
 3. Push to `main`.
-4. Add a fine-grained PAT with write access to `ZibbyHQ/homebrew-tap` and
+4. Add a fine-grained PAT with write access to `ZibbyDev/homebrew-tap` and
    expose it as the `HOMEBREW_TAP_TOKEN` secret on the `agent-ops` repo's
    Actions settings — goreleaser uses this to PR the cask update on each
    tag push.

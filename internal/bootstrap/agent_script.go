@@ -68,10 +68,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ZibbyHQ/agent-ops/internal/config"
-	"github.com/ZibbyHQ/agent-ops/internal/driver"
-	"github.com/ZibbyHQ/agent-ops/internal/driver/claudecli"
-	"github.com/ZibbyHQ/agent-ops/internal/state"
+	"github.com/ZibbyDev/agent-ops/internal/config"
+	"github.com/ZibbyDev/agent-ops/internal/driver"
+	"github.com/ZibbyDev/agent-ops/internal/driver/claudecli"
+	"github.com/ZibbyDev/agent-ops/internal/state"
 )
 
 // agentScriptModeName is the AGENT_OPS_BOOTSTRAP_MODE value that selects

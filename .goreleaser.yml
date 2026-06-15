@@ -8,7 +8,7 @@
 #   - 2 Debian .deb packages (linux/amd64, linux/arm64).
 #   - SHA256SUMS.txt — checksums for everything in the release.
 #   - GitHub Release with all of the above attached.
-#   - A bumped homebrew Formula PRed against ZibbyHQ/homebrew-tap.
+#   - A bumped homebrew Formula PRed against ZibbyDev/homebrew-tap.
 #
 # The existing GHCR Docker push (`docker` job in release.yml) is intentionally
 # left in place rather than folded in here — goreleaser's docker builder
@@ -86,7 +86,7 @@ nfpms:
       - agent-opsd
       - agent-ops
     vendor: Zibby Lab
-    homepage: https://github.com/ZibbyHQ/agent-ops
+    homepage: https://github.com/ZibbyDev/agent-ops
     maintainer: Zibby Lab <oss@zibby.dev>
     description: |-
       Autonomous DevOps engineer for a single host.
@@ -109,7 +109,7 @@ homebrew_casks:
   # Homebrew tap auto-PR. goreleaser commits the rendered cask to the
   # `homebrew-tap` repo on the configured GitHub org — operator picks it up
   # and merges. The operator MUST have already created
-  # github.com/ZibbyHQ/homebrew-tap manually (see homebrew-tap-stub/ in this
+  # github.com/ZibbyDev/homebrew-tap manually (see homebrew-tap-stub/ in this
   # repo for the stub layout) and granted the release workflow a fine-grained
   # PAT exposed as HOMEBREW_TAP_TOKEN.
   #
@@ -133,7 +133,7 @@ homebrew_casks:
     ids:
       - combined
     repository:
-      owner: ZibbyHQ
+      owner: ZibbyDev
       name: homebrew-tap
       branch: main
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
@@ -142,7 +142,7 @@ homebrew_casks:
     commit_author:
       name: zibby-bot
       email: oss@zibby.dev
-    homepage: https://github.com/ZibbyHQ/agent-ops
+    homepage: https://github.com/ZibbyDev/agent-ops
     description: Autonomous DevOps engineer for a single host.
     license: Apache-2.0
     binaries:
@@ -175,7 +175,7 @@ changelog:
 
 release:
   github:
-    owner: ZibbyHQ
+    owner: ZibbyDev
     name: agent-ops
   prerelease: auto
   draft: false
@@ -187,7 +187,7 @@ release:
 
     ```bash
     brew install zibbyhq/tap/agent-ops               # macOS / Linuxbrew
-    curl -fsSL https://github.com/ZibbyHQ/agent-ops/releases/download/v{{.Version}}/agent-ops_linux_amd64.tar.gz \
+    curl -fsSL https://github.com/ZibbyDev/agent-ops/releases/download/v{{.Version}}/agent-ops_linux_amd64.tar.gz \
       | sudo tar -xz -C /usr/local/bin
     ```
 

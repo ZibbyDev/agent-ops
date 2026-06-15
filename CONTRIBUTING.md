@@ -24,7 +24,7 @@ Types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `perf`.
 
 ```bash
 # clone
-git clone https://github.com/ZibbyHQ/agent-ops.git
+git clone https://github.com/ZibbyDev/agent-ops.git
 cd agent-ops
 
 # install deps + build

@@ -3,7 +3,7 @@ package daemon
 import (
 	"testing"
 
-	"github.com/ZibbyHQ/agent-ops/internal/config"
+	"github.com/ZibbyDev/agent-ops/internal/config"
 )
 
 // schedulerGate must idle the autonomous scheduler when the app has agent-ops

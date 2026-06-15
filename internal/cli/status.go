@@ -11,9 +11,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/ZibbyHQ/agent-ops/internal/config"
-	"github.com/ZibbyHQ/agent-ops/internal/service"
-	"github.com/ZibbyHQ/agent-ops/internal/state"
+	"github.com/ZibbyDev/agent-ops/internal/config"
+	"github.com/ZibbyDev/agent-ops/internal/service"
+	"github.com/ZibbyDev/agent-ops/internal/state"
 )
 
 func newStatusCmd() *cobra.Command {

@@ -2,7 +2,7 @@
 
 > stdio MCP bridge — connect a local AI agent (Claude Code, Cursor, OpenAI Codex CLI, Gemini CLI) to a remote agent-ops daemon.
 
-The [`agent-ops`](https://github.com/ZibbyHQ/agent-ops) daemon speaks MCP over Streamable HTTP at `/mcp`. In theory every modern MCP client supports remote HTTP transport — in practice their support varies (auth-header propagation, SSE channel survival, HTTPS strictness, version drift). The stdio transport, on the other hand, is universally supported.
+The [`agent-ops`](https://github.com/ZibbyDev/agent-ops) daemon speaks MCP over Streamable HTTP at `/mcp`. In theory every modern MCP client supports remote HTTP transport — in practice their support varies (auth-header propagation, SSE channel survival, HTTPS strictness, version drift). The stdio transport, on the other hand, is universally supported.
 
 This package is a tiny (~250 line, zero-dep) stdio MCP server that lives in your AI agent's local process. Every JSON-RPC frame it receives, it forwards as one HTTPS POST to your remote agent-ops daemon, then writes the response back on stdout. No translation. Full pass-through.
 

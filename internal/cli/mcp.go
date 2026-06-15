@@ -5,8 +5,8 @@ package cli
 import (
 	"github.com/spf13/cobra"
 
-	"github.com/ZibbyHQ/agent-ops/internal/bootstrap"
-	"github.com/ZibbyHQ/agent-ops/internal/config"
+	"github.com/ZibbyDev/agent-ops/internal/bootstrap"
+	"github.com/ZibbyDev/agent-ops/internal/config"
 )
 
 func newMCPCmd() *cobra.Command {

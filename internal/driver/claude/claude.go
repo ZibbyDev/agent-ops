@@ -19,8 +19,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ZibbyHQ/agent-ops/internal/driver"
-	"github.com/ZibbyHQ/agent-ops/internal/tool"
+	"github.com/ZibbyDev/agent-ops/internal/driver"
+	"github.com/ZibbyDev/agent-ops/internal/tool"
 )
 
 // Driver implements driver.Driver against Anthropic's Messages API.

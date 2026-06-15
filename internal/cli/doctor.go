@@ -14,7 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/ZibbyHQ/agent-ops/internal/config"
+	"github.com/ZibbyDev/agent-ops/internal/config"
 )
 
 // newDoctorCmd runs a battery of "is this host ready?" checks. Each check

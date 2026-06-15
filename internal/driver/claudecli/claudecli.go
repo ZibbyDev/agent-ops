@@ -37,7 +37,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ZibbyHQ/agent-ops/internal/driver"
+	"github.com/ZibbyDev/agent-ops/internal/driver"
 )
 
 // Driver implements driver.Driver against the `claude` CLI binary.

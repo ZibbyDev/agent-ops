@@ -47,7 +47,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/ZibbyHQ/agent-ops/internal/driver"
+	"github.com/ZibbyDev/agent-ops/internal/driver"
 )
 
 // Driver implements driver.Driver against the `codex` CLI binary.

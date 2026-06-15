@@ -23,7 +23,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/ZibbyHQ/agent-ops/internal/daemon"
+	"github.com/ZibbyDev/agent-ops/internal/daemon"
 )
 
 // version is set via -ldflags by the release pipeline.

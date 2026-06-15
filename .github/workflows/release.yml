@@ -27,7 +27,7 @@ jobs:
           # GITHUB_TOKEN can write GitHub Releases on this repo.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # HOMEBREW_TAP_TOKEN: a fine-grained PAT with write access to
-          # ZibbyHQ/homebrew-tap. Goreleaser needs cross-repo push to land
+          # ZibbyDev/homebrew-tap. Goreleaser needs cross-repo push to land
           # the cask update. Add via repo Settings → Secrets and variables
           # → Actions BEFORE pushing the first tag, otherwise the release
           # still ships binaries (Linux/Mac tarballs + .deb) but the brew

@@ -28,7 +28,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/ZibbyHQ/agent-ops/internal/bootstrap"
+	"github.com/ZibbyDev/agent-ops/internal/bootstrap"
 )
 
 // newBootstrapCmd builds the `bootstrap` subcommand. Hidden from

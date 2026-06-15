@@ -8,7 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/ZibbyHQ/agent-ops/internal/daemon"
+	"github.com/ZibbyDev/agent-ops/internal/daemon"
 )
 
 // newDaemonCmd exposes the daemon loop as `agent-ops daemon` for parity with

@@ -14,7 +14,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/ZibbyHQ/agent-ops/internal/config"
+	"github.com/ZibbyDev/agent-ops/internal/config"
 )
 
 // baseConfig is the minimum valid config.yaml an integration tests

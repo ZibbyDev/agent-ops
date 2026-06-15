@@ -24,7 +24,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ZibbyHQ/agent-ops/internal/appauth"
+	"github.com/ZibbyDev/agent-ops/internal/appauth"
 )
 
 // RegisterPortIfNeeded picks the app's port and POSTs it to Zibby. Priority:

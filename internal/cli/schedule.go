@@ -8,7 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/ZibbyHQ/agent-ops/internal/config"
+	"github.com/ZibbyDev/agent-ops/internal/config"
 )
 
 func newScheduleCmd() *cobra.Command {

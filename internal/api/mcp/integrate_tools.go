@@ -7,7 +7,7 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/ZibbyHQ/agent-ops/internal/integrate"
+	"github.com/ZibbyDev/agent-ops/internal/integrate"
 )
 
 // toolIntegrateAdd wires `agent-ops integrate add` semantics over MCP.

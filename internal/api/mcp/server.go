@@ -37,12 +37,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ZibbyHQ/agent-ops/internal/appauth"
+	"github.com/ZibbyDev/agent-ops/internal/appauth"
 
-	"github.com/ZibbyHQ/agent-ops/examples"
-	"github.com/ZibbyHQ/agent-ops/internal/scheduler"
-	"github.com/ZibbyHQ/agent-ops/internal/state"
-	"github.com/ZibbyHQ/agent-ops/internal/tool"
+	"github.com/ZibbyDev/agent-ops/examples"
+	"github.com/ZibbyDev/agent-ops/internal/scheduler"
+	"github.com/ZibbyDev/agent-ops/internal/state"
+	"github.com/ZibbyDev/agent-ops/internal/tool"
 )
 
 // defaultAllowedOrigins is the baked-in CORS allowlist for browser callers.

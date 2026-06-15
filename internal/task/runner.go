@@ -24,10 +24,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ZibbyHQ/agent-ops/internal/driver"
-	"github.com/ZibbyHQ/agent-ops/internal/runreport"
-	"github.com/ZibbyHQ/agent-ops/internal/state"
-	"github.com/ZibbyHQ/agent-ops/internal/tool"
+	"github.com/ZibbyDev/agent-ops/internal/driver"
+	"github.com/ZibbyDev/agent-ops/internal/runreport"
+	"github.com/ZibbyDev/agent-ops/internal/state"
+	"github.com/ZibbyDev/agent-ops/internal/tool"
 )
 
 // Runner ties together driver, tool registry, and state store.

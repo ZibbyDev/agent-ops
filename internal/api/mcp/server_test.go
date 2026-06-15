@@ -14,11 +14,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ZibbyHQ/agent-ops/internal/driver"
-	"github.com/ZibbyHQ/agent-ops/internal/scheduler"
-	"github.com/ZibbyHQ/agent-ops/internal/state"
-	"github.com/ZibbyHQ/agent-ops/internal/task"
-	"github.com/ZibbyHQ/agent-ops/internal/tool"
+	"github.com/ZibbyDev/agent-ops/internal/driver"
+	"github.com/ZibbyDev/agent-ops/internal/scheduler"
+	"github.com/ZibbyDev/agent-ops/internal/state"
+	"github.com/ZibbyDev/agent-ops/internal/task"
+	"github.com/ZibbyDev/agent-ops/internal/tool"
 )
 
 type fakeDriver struct{}

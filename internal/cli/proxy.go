@@ -23,7 +23,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/ZibbyHQ/agent-ops/internal/proxy"
+	"github.com/ZibbyDev/agent-ops/internal/proxy"
 )
 
 // ssmResolveTimeout caps the SSM-param resolution at startup. On a fresh or

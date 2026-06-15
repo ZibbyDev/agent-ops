@@ -6,7 +6,7 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/ZibbyHQ/agent-ops/internal/tool"
+	"github.com/ZibbyDev/agent-ops/internal/tool"
 )
 
 // ToolInvoker adapts a mcpclient.Client into the tool.RemoteInvoker

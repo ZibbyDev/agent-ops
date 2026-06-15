@@ -27,10 +27,10 @@
   ],
   "license": "Apache-2.0",
   "author": "Zibby Lab",
-  "homepage": "https://github.com/ZibbyHQ/agent-ops",
+  "homepage": "https://github.com/ZibbyDev/agent-ops",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ZibbyHQ/agent-ops.git",
+    "url": "https://github.com/ZibbyDev/agent-ops.git",
     "directory": "clients/mcp-bridge"
   },
   "engines": {

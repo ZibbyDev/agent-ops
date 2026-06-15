@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ZibbyHQ/agent-ops/internal/driver"
-	"github.com/ZibbyHQ/agent-ops/internal/tool"
+	"github.com/ZibbyDev/agent-ops/internal/driver"
+	"github.com/ZibbyDev/agent-ops/internal/tool"
 )
 
 // scriptedHandler returns scripted responses in order. Each call consumes one.

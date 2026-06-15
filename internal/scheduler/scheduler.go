@@ -23,9 +23,9 @@ import (
 
 	"github.com/robfig/cron/v3"
 
-	"github.com/ZibbyHQ/agent-ops/internal/config"
-	"github.com/ZibbyHQ/agent-ops/internal/state"
-	"github.com/ZibbyHQ/agent-ops/internal/task"
+	"github.com/ZibbyDev/agent-ops/internal/config"
+	"github.com/ZibbyDev/agent-ops/internal/state"
+	"github.com/ZibbyDev/agent-ops/internal/task"
 )
 
 // Scheduler wraps robfig/cron with daemon-specific glue.

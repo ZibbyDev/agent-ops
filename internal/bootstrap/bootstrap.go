@@ -29,11 +29,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ZibbyHQ/agent-ops/internal/config"
-	"github.com/ZibbyHQ/agent-ops/internal/scheduler"
-	"github.com/ZibbyHQ/agent-ops/internal/state"
-	"github.com/ZibbyHQ/agent-ops/internal/task"
-	"github.com/ZibbyHQ/agent-ops/internal/zibby"
+	"github.com/ZibbyDev/agent-ops/internal/config"
+	"github.com/ZibbyDev/agent-ops/internal/scheduler"
+	"github.com/ZibbyDev/agent-ops/internal/state"
+	"github.com/ZibbyDev/agent-ops/internal/task"
+	"github.com/ZibbyDev/agent-ops/internal/zibby"
 )
 
 // EnsureToken returns the daemon's MCP bearer token. Priority:

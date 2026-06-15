@@ -10,7 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/ZibbyHQ/agent-ops/internal/integrate"
+	"github.com/ZibbyDev/agent-ops/internal/integrate"
 )
 
 // newIntegrateCmd builds the `agent-ops integrate {add,remove,list}`

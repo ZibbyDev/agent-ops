@@ -9,7 +9,7 @@ package driver
 import (
 	"context"
 
-	"github.com/ZibbyHQ/agent-ops/internal/tool"
+	"github.com/ZibbyDev/agent-ops/internal/tool"
 )
 
 // Driver runs one agent loop: given a system prompt + user task + tool

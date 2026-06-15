@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ZibbyHQ/agent-ops/internal/config"
+	"github.com/ZibbyDev/agent-ops/internal/config"
 )
 
 // TestRenderConfigYAML_RoundTrip pins the contract between

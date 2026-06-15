@@ -60,7 +60,7 @@ If you'd rather not go through dl.zibby.app, every release is also
 attached directly to its GitHub Release:
 
 ```bash
-curl -fsSL https://github.com/ZibbyHQ/agent-ops/releases/latest/download/agent-ops_linux_amd64.tar.gz \
+curl -fsSL https://github.com/ZibbyDev/agent-ops/releases/latest/download/agent-ops_linux_amd64.tar.gz \
   | sudo tar -xz -C /usr/local/bin
 # Same URL pattern for: agent-ops_linux_arm64 / agent-ops_darwin_amd64 / agent-ops_darwin_arm64
 ```

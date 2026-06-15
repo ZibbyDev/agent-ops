@@ -12,7 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/ZibbyHQ/agent-ops/internal/service"
+	"github.com/ZibbyDev/agent-ops/internal/service"
 )
 
 func newStartCmd() *cobra.Command {

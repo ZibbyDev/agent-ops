@@ -21,7 +21,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/ZibbyHQ/agent-ops/internal/cli"
+	"github.com/ZibbyDev/agent-ops/internal/cli"
 )
 
 // version is set via -ldflags by the release pipeline.

@@ -6,10 +6,10 @@
 cask "agent-ops" do
   version "0.0.0-stub"
 
-  url "https://github.com/ZibbyHQ/agent-ops/releases"
+  url "https://github.com/ZibbyDev/agent-ops/releases"
   name "agent-ops"
   desc "Autonomous DevOps engineer for a single host."
-  homepage "https://github.com/ZibbyHQ/agent-ops"
+  homepage "https://github.com/ZibbyDev/agent-ops"
 
   # Intentionally fail until the first real release lands.
   preflight do

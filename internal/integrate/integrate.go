@@ -52,7 +52,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/ZibbyHQ/agent-ops/internal/config"
+	"github.com/ZibbyDev/agent-ops/internal/config"
 )
 
 // ErrAlreadyExists is returned by Add when an integration with the same

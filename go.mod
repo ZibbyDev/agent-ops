@@ -1,4 +1,4 @@
-module github.com/ZibbyHQ/agent-ops
+module github.com/ZibbyDev/agent-ops
 
 go 1.23
 

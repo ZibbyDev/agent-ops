@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ZibbyHQ/agent-ops/examples"
-	"github.com/ZibbyHQ/agent-ops/internal/config"
+	"github.com/ZibbyDev/agent-ops/examples"
+	"github.com/ZibbyDev/agent-ops/internal/config"
 )
 
 // TestInit_ListTemplates exercises the read-only listing path. We don't

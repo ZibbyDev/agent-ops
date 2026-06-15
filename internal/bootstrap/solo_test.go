@@ -136,7 +136,7 @@ func TestSoloRunnerLoadParsesSpec(t *testing.T) {
 	dir := t.TempDir()
 	spec := SoloSpec{
 		AppSlug:   "hello",
-		Source:    SoloSource{Type: "github", Repo: "ZibbyHQ/hello"},
+		Source:    SoloSource{Type: "github", Repo: "ZibbyDev/hello"},
 		Framework: "auto",
 		Tier:      "micro",
 		Domain:    "hello.solo.zibby.app",

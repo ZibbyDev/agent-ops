@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ZibbyHQ/agent-ops/internal/driver"
+	"github.com/ZibbyDev/agent-ops/internal/driver"
 )
 
 // fakeCodexCLI writes a shell script in tmpDir that, when invoked,
