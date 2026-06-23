@@ -36,10 +36,6 @@ RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # so we don't need a separate NodeSource setup step.
 FROM node:20-bookworm-slim
 
-# Buildx provides TARGETARCH per-platform leg (amd64 | arm64). We re-declare it
-# in this stage so the codebase-memory-mcp fetch below picks the matching asset.
-ARG TARGETARCH=amd64
-
 # `apt-get install` defaults to interactive prompts; non-interactive lets
 # `tzdata` and friends install silently.
 ENV DEBIAN_FRONTEND=noninteractive
@@ -83,47 +79,6 @@ COPY --from=build /out/agent-opsd /usr/local/bin/agent-opsd
 COPY --from=build /out/agent-ops /usr/local/bin/agent-ops
 
 COPY config.example.yaml /etc/agent-ops/config.yaml
-
-# ─── codebase-memory-mcp (DeusData, MIT + Apache-2.0 nomic embeddings) ───────
-# Code-graph + semantic codebase-memory MCP server, baked in so the
-# @zibby/skills `codebase-memory` skill can spawn /usr/local/bin/codebase-memory-mcp
-# with ZERO runtime download. We fetch the PORTABLE static build (works on this
-# Debian/glibc base regardless of host libc), pin the version + sha256, and
-# verify the checksum BEFORE extracting — never `curl | bash`. ARCH MISMATCH is
-# the #1 trap: TARGETARCH (amd64|arm64) selects the matching release asset so
-# the manifest list is correct on both Fargate x86 and ARM tasks.
-#
-# Attribution obligation (MIT + Apache-2.0): the LICENSE and
-# THIRD_PARTY_NOTICES.md shipped in the tarball are copied to
-# /usr/local/share/codebase-memory-mcp/NOTICES/.
-#
-# Bump CBM_VERSION + the matching sha256 together when upgrading. Checksums are
-# the official release `checksums.txt` values for v0.8.1 (verified out-of-band).
-ARG CBM_VERSION=0.8.1
-ARG CBM_SHA256_AMD64=6ab87a6c05d049dde57700803ca0ab4199fcf25973a0606618af0fcee73f5abd
-ARG CBM_SHA256_ARM64=13526acc2a6a0697dff3c763fb443a416589bc10ad8b12015b63d87e515dd72b
-RUN set -eux; \
-    case "${TARGETARCH}" in \
-      amd64) CBM_SHA="${CBM_SHA256_AMD64}" ;; \
-      arm64) CBM_SHA="${CBM_SHA256_ARM64}" ;; \
-      *) echo "unsupported TARGETARCH=${TARGETARCH} for codebase-memory-mcp" >&2; exit 1 ;; \
-    esac; \
-    asset="codebase-memory-mcp-linux-${TARGETARCH}-portable.tar.gz"; \
-    url="https://github.com/DeusData/codebase-memory-mcp/releases/download/v${CBM_VERSION}/${asset}"; \
-    tmp="$(mktemp -d)"; \
-    curl -fsSL --retry 3 -o "${tmp}/${asset}" "${url}"; \
-    echo "${CBM_SHA}  ${tmp}/${asset}" | sha256sum -c -; \
-    tar -xzf "${tmp}/${asset}" -C "${tmp}"; \
-    bin="$(find "${tmp}" -type f -name codebase-memory-mcp | head -n1)"; \
-    test -n "${bin}"; \
-    install -m 0755 "${bin}" /usr/local/bin/codebase-memory-mcp; \
-    mkdir -p /usr/local/share/codebase-memory-mcp/NOTICES; \
-    for f in LICENSE THIRD_PARTY_NOTICES.md; do \
-      src="$(find "${tmp}" -type f -name "${f}" | head -n1)"; \
-      if [ -n "${src}" ]; then cp "${src}" "/usr/local/share/codebase-memory-mcp/NOTICES/${f}"; fi; \
-    done; \
-    /usr/local/bin/codebase-memory-mcp --help >/dev/null 2>&1 || true; \
-    rm -rf "${tmp}"
 
 # Claude Code CLI's Bash tool requires /bin/bash explicitly; SHELL=/bin/bash
 # is on Debian by default but we set it for parity with the old Alpine image.
