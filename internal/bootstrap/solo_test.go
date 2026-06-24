@@ -144,7 +144,7 @@ func TestSoloRunnerLoadParsesSpec(t *testing.T) {
 	}
 	specPath := filepath.Join(dir, "spec.json")
 	writeJSON(t, specPath, spec)
-	writeFile(t, filepath.Join(dir, "account-id"), "455456047181")
+	writeFile(t, filepath.Join(dir, "account-id"), "123456789012")
 	writeFile(t, filepath.Join(dir, "deployment-id"), "dep_abc123")
 	writeFile(t, filepath.Join(dir, "status-url"), "https://api-dev.zibby.app/apps/solo/hello/status")
 	writeFile(t, filepath.Join(dir, "phase-token"), "tok_secret_per_deploy\n")
@@ -169,14 +169,14 @@ func TestSoloRunnerLoadParsesSpec(t *testing.T) {
 	if r.spec.AppSlug != "hello" {
 		t.Errorf("AppSlug: want hello, got %s", r.spec.AppSlug)
 	}
-	if r.accountID != "455456047181" {
-		t.Errorf("accountID: want 455…, got %s", r.accountID)
+	if r.accountID != "123456789012" {
+		t.Errorf("accountID: want 123…, got %s", r.accountID)
 	}
 	// Status URL gets canonicalised to the phase POST route.
 	if !strings.HasSuffix(r.statusURL, "/phase") {
 		t.Errorf("statusURL should end with /phase, got %s", r.statusURL)
 	}
-	if r.dbBucketName() != "zibby-solo-455456047181-hello-db" {
+	if r.dbBucketName() != "zibby-solo-123456789012-hello-db" {
 		t.Errorf("dbBucketName: got %s", r.dbBucketName())
 	}
 }
@@ -438,7 +438,7 @@ func TestMaybeRestoreFromLitestreamSkipsWhenLocalDBExists(t *testing.T) {
 			AppSlug: "rails-blog",
 			Persist: SoloPersist{DB: "sqlite-litestream"},
 		},
-		accountID: "455456047181",
+		accountID: "123456789012",
 	}
 	err := r.maybeRestoreFromLitestream(context.Background())
 	if err != nil {
@@ -466,7 +466,7 @@ func TestMaybeRestoreFromLitestreamCallsLitestreamWhenDBMissing(t *testing.T) {
 			AppSlug: "rails-blog",
 			Persist: SoloPersist{DB: "sqlite-litestream"},
 		},
-		accountID: "455456047181",
+		accountID: "123456789012",
 	}
 	// stub returns OK for the litestream restore so the first candidate
 	// "succeeds" and we return early.
